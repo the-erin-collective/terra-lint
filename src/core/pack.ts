@@ -9,6 +9,8 @@ export class Pack {
     public registry = new Registry();
     public diagnostics: Diagnostic[] = [];
     public rootPath: string;
+    public stageIds: Set<string> = new Set();
+    public structureFiles: Set<string> = new Set();
 
     constructor(rootPath: string) {
         this.rootPath = path.resolve(rootPath);
@@ -26,17 +28,53 @@ export class Pack {
             return;
         }
 
+        const content = readFileSync(packYmlPath, 'utf8');
+        const { parsed, diagnostics } = parseYaml(content, 'pack.yml');
+        this.diagnostics.push(...diagnostics);
+        if (parsed && parsed.doc.contents) {
+            const contents = parsed.doc.contents as any;
+            if (contents.get && contents.get('stages')) {
+                const stages = contents.get('stages', true);
+                if (Array.isArray(stages.items)) {
+                    for (const item of stages.items) {
+                        if (item) {
+                            if (typeof item.value === 'string' || typeof item.value === 'number') {
+                                this.stageIds.add(String(item.value).toUpperCase());
+                            } else if (typeof item.get === 'function') {
+                                const idNode = item.get('id', true);
+                                if (idNode && (typeof idNode.value === 'string' || typeof idNode.value === 'number')) {
+                                    this.stageIds.add(String(idNode.value).toUpperCase());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Load all .yml files
         const files = await fg('**/*.yml', { cwd: this.rootPath, absolute: true });
 
         for (const file of files) {
-            const content = readFileSync(file, 'utf8');
             const relativePath = path.relative(this.rootPath, file);
+            if (relativePath === 'pack.yml') continue;
+
+            const content = readFileSync(file, 'utf8');
             const { parsed, diagnostics } = parseYaml(content, relativePath);
 
             this.diagnostics.push(...diagnostics);
 
             if (parsed) {
-                this.registry.addParsedDoc(parsed);
+                this.registry.addParsedDoc(parsed, this);
+            }
+        }
+
+        // Load structure files
+        const structPath = path.join(this.rootPath, 'structures');
+        if (existsSync(structPath)) {
+            const structFiles = await fg('**/*.{nbt,terra,tesf}', { cwd: structPath });
+            for (const f of structFiles) {
+                this.structureFiles.add(f.toUpperCase().replace(/\\/g, '/'));
             }
         }
     }
@@ -54,6 +92,27 @@ export class Pack {
                     for (const item of effective.slant) {
                         if (item.palette) {
                             this.validatePalette(item.palette, biome.parsedYaml.filePath);
+                        }
+                    }
+                }
+
+                // Validate stages in features
+                if (effective.features && typeof effective.features === 'object') {
+                    for (const [stageKey, stageFeatures] of Object.entries(effective.features)) {
+                        if (!this.stageIds.has(stageKey.toUpperCase())) {
+                            this.diagnostics.push({
+                                code: 'STAGE_MISSING',
+                                message: `Referenced stage "${stageKey}" not found in pack.yml`,
+                                severity: 'error',
+                                file: biome.parsedYaml.filePath
+                            });
+                        }
+                        if (Array.isArray(stageFeatures)) {
+                            for (const featureId of stageFeatures) {
+                                if (typeof featureId === 'string') {
+                                    this.validateStructureReference(featureId, biome.parsedYaml.filePath);
+                                }
+                            }
                         }
                     }
                 }
@@ -92,18 +151,41 @@ export class Pack {
                     });
                 } else if (keys.length === 1) {
                     const id = keys[0];
-                    // If it's not a prefixed block ID (minecraft:...), check if it's a registered palette
                     if (!id.includes(':')) {
                         if (!this.registry.getObject('PALETTE', id)) {
                             this.diagnostics.push({
                                 code: 'PALETTE_MISSING',
                                 message: `Referenced palette "${id}" not found. If this is a block ID, use "minecraft:${id}" or "BLOCK:minecraft:${id}".`,
-                                severity: 'warning', // Warning because it might be a block ID without prefix that Terra supports
+                                severity: 'warning',
                                 file: filePath
                             });
                         }
                     }
                 }
+            }
+        }
+    }
+
+    private validateStructureReference(id: string, filePath: string) {
+        // Dual Lookup: Registry or Filesystem
+        const inRegistry = this.registry.getObject('STRUCTURE', id);
+        if (inRegistry) return;
+
+        // Filesystem check: path/to/name.nbt or just name.nbt
+        const idUpper = id.toUpperCase().replace(/\\/g, '/');
+        const hasMatch = Array.from(this.structureFiles).some(f =>
+            f === idUpper || f.endsWith('/' + idUpper) || f.replace(/\.[^/.]+$/, "") === idUpper || f.replace(/\.[^/.]+$/, "").endsWith('/' + idUpper)
+        );
+
+        if (!hasMatch) {
+            // It could also be a FEATURE reference, not just structure
+            if (!this.registry.getObject('FEATURE', id)) {
+                this.diagnostics.push({
+                    code: 'FEATURE_MISSING',
+                    message: `Referenced feature/structure "${id}" not found in registry or structures/ directory.`,
+                    severity: 'error',
+                    file: filePath
+                });
             }
         }
     }

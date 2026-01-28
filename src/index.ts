@@ -41,6 +41,16 @@ program
         if (errors.length > 0) {
             process.exit(1);
         }
+
+        const maxWarnings = options.maxWarnings !== undefined ? parseInt(options.maxWarnings) : -1;
+        if (options.strict && warnings.length > 0) {
+            console.error('\nStrict mode: failing due to warnings.');
+            process.exit(1);
+        }
+        if (maxWarnings >= 0 && warnings.length > maxWarnings) {
+            console.error(`\nFailing due to exceeding max warnings (${warnings.length} > ${maxWarnings}).`);
+            process.exit(1);
+        }
     });
 
 program.parse();

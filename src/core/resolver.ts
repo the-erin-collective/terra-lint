@@ -6,16 +6,25 @@ export function resolveValue(node: Node | null | undefined, pack: Pack, parentDo
     if (!node) return undefined;
 
     if (isScalar(node)) {
-        const val = String(node.value);
+        let val = String(node.value);
+
+        // Handle numeric underscores (e.g., 1_000_000)
+        if (/^\d[0-9_]*$/.test(val) && val.includes('_')) {
+            val = val.replace(/_/g, '');
+            if (!isNaN(Number(val))) return Number(val);
+        }
+
         if (val.startsWith('$')) {
             // Handle $file.yml:path.to.thing
-            return resolveMetaRef(val, pack);
+            return resolveMetaRef(val, pack, parentDoc, node);
         }
         if (val.startsWith('<<')) {
             const ref = val.substring(2).trim();
-            return resolveMetaRef('$' + ref, pack);
+            return resolveMetaRef('$' + ref, pack, parentDoc, node);
         }
-        return node.value;
+
+        // return the cleaned string or number
+        return val === String(node.value) ? node.value : val;
     }
 
     if (isMap(node)) {
@@ -52,7 +61,7 @@ export function resolveValue(node: Node | null | undefined, pack: Pack, parentDo
     return undefined;
 }
 
-function resolveMetaRef(ref: string, pack: Pack): any {
+function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, node?: any): any {
     // Handle $file.yml:path.to.thing or $file.yml:top-level-key
     let pathStr = ref.substring(1);
     if (pathStr.startsWith('{') && pathStr.endsWith('}')) {
@@ -73,7 +82,6 @@ function resolveMetaRef(ref: string, pack: Pack): any {
     const pathInFile = parts.slice(1).join(':').split('.');
 
     if (!pack || !pack.registry) {
-        // console.warn('Pack or Registry undefined during resolution');
         return ref;
     }
 
@@ -81,6 +89,16 @@ function resolveMetaRef(ref: string, pack: Pack): any {
     const doc = allDocs.find(d => d.filePath === filePath || d.filePath.endsWith(filePath) || d.filePath.endsWith('/' + filePath) || d.filePath.endsWith('\\' + filePath));
 
     if (!doc) {
+        pack.diagnostics.push({
+            code: 'META_REF_FILE_MISSING',
+            message: `Referenced meta file "${filePath}" not found.`,
+            severity: 'error',
+            file: parentDoc.filePath,
+            range: node?.range ? {
+                start: { ...parentDoc.lineCounter.linePos(node.range[0]), offset: node.range[0] },
+                end: { ...parentDoc.lineCounter.linePos(node.range[1]), offset: node.range[1] }
+            } : undefined
+        });
         return ref;
     }
 
@@ -89,12 +107,20 @@ function resolveMetaRef(ref: string, pack: Pack): any {
         if (isMap(current)) {
             current = current.get(part, true) as any;
         } else {
-            // console.warn(`Meta ref path not found: ${part} in ${ref}`);
+            pack.diagnostics.push({
+                code: 'META_REF_PATH_MISSING',
+                message: `Path "${pathInFile.join('.')}" not found in meta file "${filePath}". Missing: "${part}"`,
+                severity: 'error',
+                file: parentDoc.filePath,
+                range: node?.range ? {
+                    start: { ...parentDoc.lineCounter.linePos(node.range[0]), offset: node.range[0] },
+                    end: { ...parentDoc.lineCounter.linePos(node.range[1]), offset: node.range[1] }
+                } : undefined
+            });
             return ref;
         }
     }
 
-    // console.log(`Resolved ${ref} to node type: ${current?.constructor.name}`);
     return resolveValue(current, pack, doc);
 }
 

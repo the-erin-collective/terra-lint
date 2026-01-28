@@ -16,7 +16,7 @@ export class Registry {
     private byType = new Map<string, Map<string, ConfigObject>>();
     private allDocs = new Map<string, ParsedYaml>();
 
-    addParsedDoc(doc: ParsedYaml) {
+    addParsedDoc(doc: ParsedYaml, pack: Pack) {
         this.allDocs.set(doc.filePath, doc);
 
         const root = doc.doc.contents;
@@ -26,7 +26,8 @@ export class Registry {
 
             if (isScalar(typeNode) && isScalar(idNode)) {
                 const typeStr = String(typeNode.value).toUpperCase();
-                const idStr = String(idNode.value).toUpperCase();
+                const idStr = String(idNode.value);
+                const idKey = idStr.toUpperCase();
 
                 let typeMap = this.byType.get(typeStr);
                 if (!typeMap) {
@@ -34,9 +35,23 @@ export class Registry {
                     this.byType.set(typeStr, typeMap);
                 }
 
+                if (typeMap.has(idKey)) {
+                    const existing = typeMap.get(idKey)!;
+                    pack.diagnostics.push({
+                        code: 'DUPLICATE_ID',
+                        message: `Duplicate ID "${idStr}" for type "${typeStr}". Already defined in ${existing.parsedYaml.filePath}`,
+                        severity: 'error',
+                        file: doc.filePath,
+                        range: idNode.range ? {
+                            start: { ...doc.lineCounter.linePos(idNode.range[0]), offset: idNode.range[0] },
+                            end: { ...doc.lineCounter.linePos(idNode.range[1]), offset: idNode.range[1] }
+                        } : undefined
+                    });
+                }
+
                 const obj: ConfigObject = {
                     type: typeStr,
-                    id: idStr,
+                    id: idStr, // Original casing
                     parsedYaml: doc,
                     node: root
                 };
@@ -44,13 +59,13 @@ export class Registry {
                 const extNode = root.get('extends', true);
                 if (extNode) {
                     if (isScalar(extNode)) {
-                        obj.extends = String(extNode.value).toUpperCase();
+                        obj.extends = String(extNode.value);
                     } else if (isSeq(extNode)) {
-                        obj.extends = (extNode as any).items.map((item: any) => isScalar(item) ? String(item.value).toUpperCase() : '').filter(Boolean);
+                        obj.extends = (extNode as any).items.map((item: any) => isScalar(item) ? String(item.value) : '').filter(Boolean);
                     }
                 }
 
-                typeMap.set(idStr, obj);
+                typeMap.set(idKey, obj);
             }
         }
     }
@@ -64,43 +79,50 @@ export class Registry {
         return this.byType.get(type.toUpperCase())?.get(id.toUpperCase());
     }
 
-    getEffectiveObject(type: string, id: string, pack: Pack, seen = new Set<string>()): any {
+    getEffectiveObject(type: string, id: string, pack: Pack, seen = new Map<string, string>()): any {
         const typeUpper = type.toUpperCase();
         const idUpper = id.toUpperCase();
         const key = `${typeUpper}:${idUpper}`;
-        if (seen.has(key)) {
-            throw new Error(`Circular inheritance detected: ${Array.from(seen).join(' -> ')} -> ${key}`);
-        }
-        seen.add(key);
-
         const obj = this.getObject(type, id);
+
         if (!obj) return undefined;
 
-        let base: any = {};
-        if (obj.extends) {
-            const parentIds = Array.isArray(obj.extends) ? obj.extends : [obj.extends];
-            // Terra Semantics: earlier extends have higher priority for filling blanks
-            // This means we should merge them in REVERSE order so earlier ones overwrite later ones
-            for (const parentId of [...parentIds].reverse()) {
-                const parentEffective = this.getEffectiveObject(type, parentId, pack, seen); // Pass same 'seen' to collect chain
-                if (parentEffective) {
-                    Object.assign(base, parentEffective);
-                } else {
-                    pack.diagnostics.push({
-                        code: 'EXTENDS_TARGET_MISSING',
-                        message: `Inheritance target "${parentId}" of type "${type}" not found.`,
-                        severity: 'error',
-                        file: obj.parsedYaml.filePath,
-                        // TODO: Add range for the specific extends entry if possible
-                    });
+        if (seen.has(key)) {
+            const chain = Array.from(seen.values()).concat(obj.id).join(' -> ');
+            throw new Error(`Circular inheritance detected: ${chain}`);
+        }
+        seen.set(key, obj.id);
+
+        try {
+            let base: any = {};
+            if (obj.extends) {
+                const parentIds = Array.isArray(obj.extends) ? obj.extends : [obj.extends];
+                // Terra Semantics: earlier extends have higher priority for filling blanks
+                // This means we should merge them in REVERSE order so earlier ones overwrite later ones
+                for (const parentId of [...parentIds].reverse()) {
+                    const parentEffective = this.getEffectiveObject(type, parentId, pack, seen);
+                    if (parentEffective) {
+                        // Merge parents: earlier (actually later in reverse loop) overwrite
+                        Object.assign(base, parentEffective);
+                    } else {
+                        pack.diagnostics.push({
+                            code: 'EXTENDS_TARGET_MISSING',
+                            message: `Inheritance target "${parentId}" of type "${typeUpper}" not found.`,
+                            severity: 'error',
+                            file: obj.parsedYaml.filePath,
+                        });
+                    }
                 }
             }
+
+            // Resolve the current object's values
+            const currentResolved = resolveValue(obj.node, pack, obj.parsedYaml);
+
+            // Shadowing: child values overwrite parents
+            return Object.assign(base, currentResolved);
+        } finally {
+            seen.delete(key);
         }
-
-        // Resolve the current object's values
-        const currentResolved = resolveValue(obj.node, pack, obj.parsedYaml);
-
-        return Object.assign(base, currentResolved);
     }
 
     getAllDocs(): ParsedYaml[] {
