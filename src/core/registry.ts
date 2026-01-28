@@ -96,20 +96,37 @@ export class Registry {
         try {
             let base: any = {};
             if (obj.extends) {
+                const extNode = obj.node.get('extends', true);
                 const parentIds = Array.isArray(obj.extends) ? obj.extends : [obj.extends];
                 // Terra Semantics: earlier extends have higher priority for filling blanks
                 // This means we should merge them in REVERSE order so earlier ones overwrite later ones
-                for (const parentId of [...parentIds].reverse()) {
+                for (let i = parentIds.length - 1; i >= 0; i--) {
+                    const parentId = parentIds[i];
                     const parentEffective = this.getEffectiveObject(type, parentId, pack, seen);
                     if (parentEffective) {
                         // Merge parents: earlier (actually later in reverse loop) overwrite
                         Object.assign(base, parentEffective);
                     } else {
+                        // Attempt to find range of the specific parentId in YAML
+                        let range = undefined;
+                        if (extNode) {
+                            if (isScalar(extNode) && String(extNode.value) === parentId) {
+                                range = extNode.range;
+                            } else if (isSeq(extNode)) {
+                                const item = extNode.items[i];
+                                if (item && isScalar(item)) range = item.range;
+                            }
+                        }
+
                         pack.diagnostics.push({
                             code: 'EXTENDS_TARGET_MISSING',
                             message: `Inheritance target "${parentId}" of type "${typeUpper}" not found.`,
                             severity: 'error',
                             file: obj.parsedYaml.filePath,
+                            range: range ? {
+                                start: { ...obj.parsedYaml.lineCounter.linePos(range[0]), offset: range[0] },
+                                end: { ...obj.parsedYaml.lineCounter.linePos(range[1]), offset: range[1] }
+                            } : undefined
                         });
                     }
                 }
@@ -118,7 +135,7 @@ export class Registry {
             // Resolve the current object's values
             const currentResolved = resolveValue(obj.node, pack, obj.parsedYaml);
 
-            // Shadowing: child values overwrite parents
+            // Priority Shadowing: child values overwrite parents entirely (shallow merge)
             return Object.assign(base, currentResolved);
         } finally {
             seen.delete(key);

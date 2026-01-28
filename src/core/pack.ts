@@ -1,9 +1,10 @@
 import fg from 'fast-glob';
 import { readFileSync, existsSync } from 'fs';
 import path from 'path';
-import { parseYaml } from '../parser/yaml.js';
+import { parseYaml, ParsedYaml } from '../parser/yaml.js';
 import { Registry } from './registry.js';
 import { Diagnostic } from '../types/diagnostic.js';
+import { isMap, isScalar, isSeq } from 'yaml';
 
 export class Pack {
     public registry = new Registry();
@@ -97,20 +98,42 @@ export class Pack {
                 }
 
                 // Validate stages in features
+                const featuresNode = biome.node.get('features', true);
                 if (effective.features && typeof effective.features === 'object') {
                     for (const [stageKey, stageFeatures] of Object.entries(effective.features)) {
-                        if (!this.stageIds.has(stageKey.toUpperCase())) {
-                            this.diagnostics.push({
-                                code: 'STAGE_MISSING',
-                                message: `Referenced stage "${stageKey}" not found in pack.yml`,
-                                severity: 'error',
-                                file: biome.parsedYaml.filePath
-                            });
-                        }
+                        // Only validate as a stage if it's a list (Terra features are always lists in a stage)
                         if (Array.isArray(stageFeatures)) {
-                            for (const featureId of stageFeatures) {
+                            let stageRange = undefined;
+                            if (featuresNode && isMap(featuresNode)) {
+                                const pair = (featuresNode.items as any[]).find(p => isScalar(p.key) && String(p.key.value) === stageKey);
+                                if (pair) stageRange = pair.key.range;
+                            }
+
+                            if (!this.stageIds.has(stageKey.toUpperCase())) {
+                                this.diagnostics.push({
+                                    code: 'STAGE_MISSING',
+                                    message: `Referenced stage "${stageKey}" not found in pack.yml`,
+                                    severity: 'error',
+                                    file: biome.parsedYaml.filePath,
+                                    range: stageRange ? {
+                                        start: { ...biome.parsedYaml.lineCounter.linePos(stageRange[0]), offset: stageRange[0] },
+                                        end: { ...biome.parsedYaml.lineCounter.linePos(stageRange[1]), offset: stageRange[1] }
+                                    } : undefined
+                                });
+                            }
+
+                            // Find the node for this stage's features list to get item ranges
+                            const stageNode = featuresNode && isMap(featuresNode) ? featuresNode.get(stageKey, true) as any : undefined;
+
+                            for (let i = 0; i < stageFeatures.length; i++) {
+                                const featureId = stageFeatures[i];
                                 if (typeof featureId === 'string') {
-                                    this.validateStructureReference(featureId, biome.parsedYaml.filePath);
+                                    let itemRange = undefined;
+                                    if (stageNode && isSeq(stageNode)) {
+                                        const item = (stageNode as any).items[i];
+                                        if (item && isScalar(item)) itemRange = item.range;
+                                    }
+                                    this.validateStructureReference(featureId, biome.parsedYaml, itemRange);
                                 }
                             }
                         }
@@ -129,6 +152,9 @@ export class Pack {
     }
 
     private validatePalette(palette: any, filePath: string) {
+        // We need the parsed doc to get ranges
+        const doc = this.registry.getAllDocs().find(d => d.filePath === filePath);
+
         if (!Array.isArray(palette)) {
             this.diagnostics.push({
                 code: 'INVALID_PALETTE_STRUCTURE',
@@ -166,25 +192,30 @@ export class Pack {
         }
     }
 
-    private validateStructureReference(id: string, filePath: string) {
+    private validateStructureReference(id: string, doc: ParsedYaml, range?: any) {
         // Dual Lookup: Registry or Filesystem
         const inRegistry = this.registry.getObject('STRUCTURE', id);
         if (inRegistry) return;
 
-        // Filesystem check: path/to/name.nbt or just name.nbt
+        // Filesystem check
         const idUpper = id.toUpperCase().replace(/\\/g, '/');
-        const hasMatch = Array.from(this.structureFiles).some(f =>
+        const hasFile = Array.from(this.structureFiles).some(f =>
             f === idUpper || f.endsWith('/' + idUpper) || f.replace(/\.[^/.]+$/, "") === idUpper || f.replace(/\.[^/.]+$/, "").endsWith('/' + idUpper)
         );
 
-        if (!hasMatch) {
-            // It could also be a FEATURE reference, not just structure
+        if (!hasFile) {
             if (!this.registry.getObject('FEATURE', id)) {
+                // If it looks like a file path (has extension or /), call it a structure missing
+                const isLikelyFile = id.includes('.') || id.includes('/') || id.includes('\\');
                 this.diagnostics.push({
-                    code: 'FEATURE_MISSING',
-                    message: `Referenced feature/structure "${id}" not found in registry or structures/ directory.`,
+                    code: isLikelyFile ? 'STRUCTURE_REF_MISSING' : 'FEATURE_REF_MISSING',
+                    message: `Referenced ${isLikelyFile ? 'structure' : 'feature/structure'} "${id}" not found in registry or structures/ directory.`,
                     severity: 'error',
-                    file: filePath
+                    file: doc.filePath,
+                    range: range ? {
+                        start: { ...doc.lineCounter.linePos(range[0]), offset: range[0] },
+                        end: { ...doc.lineCounter.linePos(range[1]), offset: range[1] }
+                    } : undefined
                 });
             }
         }

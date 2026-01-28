@@ -14,6 +14,57 @@ export function resolveValue(node: Node | null | undefined, pack: Pack, parentDo
             if (!isNaN(Number(val))) return Number(val);
         }
 
+        // Syntax: Absolute Value Pipes
+        const pipeCount = (val.match(/\|/g) || []).length;
+        if (pipeCount > 0 && pipeCount % 2 !== 0) {
+            pack.diagnostics.push({
+                code: 'MALFORMED_EXPRESSION',
+                message: `Unbalanced absolute value pipes in expression: "${val}"`,
+                severity: 'error',
+                file: parentDoc.filePath,
+                range: node.range ? {
+                    start: { ...parentDoc.lineCounter.linePos(node.range[0]), offset: node.range[0] },
+                    end: { ...parentDoc.lineCounter.linePos(node.range[1]), offset: node.range[1] }
+                } : undefined
+            });
+        }
+
+        // Syntax: Block States
+        // Only treat as block state if '[' appears before any '{'
+        const firstBracket = val.indexOf('[');
+        const firstBrace = val.indexOf('{');
+        if (firstBracket !== -1 && (firstBrace === -1 || firstBracket < firstBrace)) {
+            const closeIndex = val.lastIndexOf(']');
+            let isValid = true;
+            if (closeIndex === -1 || closeIndex < firstBracket || val.split('[').length !== 2 || val.split(']').length !== 2) {
+                isValid = false;
+            } else {
+                const statesPart = val.substring(firstBracket + 1, closeIndex);
+                if (statesPart.trim()) {
+                    const pairs = statesPart.split(',');
+                    for (const pair of pairs) {
+                        const eqIndex = pair.indexOf('=');
+                        if (eqIndex === -1 || eqIndex === 0 || eqIndex === pair.length - 1) {
+                            isValid = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!isValid) {
+                pack.diagnostics.push({
+                    code: 'INVALID_BLOCK_STATE',
+                    message: `Invalid block state syntax: "${val}". Expected "id[key=value, ...]"`,
+                    severity: 'error',
+                    file: parentDoc.filePath,
+                    range: node.range ? {
+                        start: { ...parentDoc.lineCounter.linePos(node.range[0]), offset: node.range[0] },
+                        end: { ...parentDoc.lineCounter.linePos(node.range[1]), offset: node.range[1] }
+                    } : undefined
+                });
+            }
+        }
+
         if (val.startsWith('$')) {
             // Handle $file.yml:path.to.thing
             return resolveMetaRef(val, pack, parentDoc, node);
@@ -106,6 +157,9 @@ function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, node?: a
     for (const part of pathInFile) {
         if (isMap(current)) {
             current = current.get(part, true) as any;
+        } else if (isSeq(current) && /^\d+$/.test(part)) {
+            const index = parseInt(part, 10);
+            current = (current as any).items[index];
         } else {
             pack.diagnostics.push({
                 code: 'META_REF_PATH_MISSING',
