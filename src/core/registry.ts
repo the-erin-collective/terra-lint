@@ -80,9 +80,17 @@ export class Registry {
             // Terra Semantics: earlier extends have higher priority for filling blanks
             // This means we should merge them in REVERSE order so earlier ones overwrite later ones
             for (const parentId of [...parentIds].reverse()) {
-                const parentEffective = this.getEffectiveObject(type, parentId, pack, new Set(seen));
+                const parentEffective = this.getEffectiveObject(type, parentId, pack, seen); // Pass same 'seen' to collect chain
                 if (parentEffective) {
                     Object.assign(base, parentEffective);
+                } else {
+                    pack.diagnostics.push({
+                        code: 'EXTENDS_TARGET_MISSING',
+                        message: `Inheritance target "${parentId}" of type "${type}" not found.`,
+                        severity: 'error',
+                        file: obj.parsedYaml.filePath,
+                        // TODO: Add range for the specific extends entry if possible
+                    });
                 }
             }
         }

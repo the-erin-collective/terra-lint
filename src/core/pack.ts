@@ -40,4 +40,21 @@ export class Pack {
             }
         }
     }
+
+    async validate() {
+        const biomes = this.registry.getObjectsByType('BIOME');
+        for (const biome of biomes) {
+            try {
+                // This will trigger EXTENDS_TARGET_MISSING diagnostics if any
+                this.registry.getEffectiveObject('BIOME', biome.id, this);
+            } catch (e: any) {
+                this.diagnostics.push({
+                    code: 'EXTENDS_CYCLE',
+                    message: e.message,
+                    severity: 'error',
+                    file: biome.parsedYaml.filePath
+                });
+            }
+        }
+    }
 }

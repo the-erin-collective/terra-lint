@@ -22,6 +22,7 @@ program
         console.log(`Linting pack at: ${pack.rootPath}`);
 
         await pack.load();
+        await pack.validate();
 
         const errors = pack.diagnostics.filter(d => d.severity === 'error');
         const warnings = pack.diagnostics.filter(d => d.severity === 'warning');
