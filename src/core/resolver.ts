@@ -137,12 +137,20 @@ function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, node?: a
     }
 
     const allDocs = pack.registry.getAllDocs();
-    const doc = allDocs.find(d => d.filePath === filePath || d.filePath.endsWith(filePath) || d.filePath.endsWith('/' + filePath) || d.filePath.endsWith('\\' + filePath));
+    const exactMatches = allDocs.filter(d => d.filePath === filePath);
 
-    if (!doc) {
+    const suffixMatches = exactMatches.length
+        ? exactMatches
+        : allDocs.filter(d =>
+            d.filePath.endsWith(filePath) ||
+            d.filePath.endsWith('/' + filePath) ||
+            d.filePath.endsWith('\\' + filePath)
+        );
+
+    if (suffixMatches.length === 0) {
         pack.diagnostics.push({
             code: 'META_REF_FILE_MISSING',
-            message: `Referenced meta file "${filePath}" not found.`,
+            message: `Meta reference file "${filePath}" not found in pack.`,
             severity: 'error',
             file: parentDoc.filePath,
             range: node?.range ? {
@@ -152,6 +160,22 @@ function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, node?: a
         });
         return ref;
     }
+
+    if (suffixMatches.length > 1) {
+        pack.diagnostics.push({
+            code: 'META_REF_AMBIGUOUS',
+            message: `Meta reference "${filePath}" matched multiple files: ${suffixMatches.map(d => d.filePath).join(', ')}. Use a more specific path.`,
+            severity: 'error',
+            file: parentDoc.filePath,
+            range: node?.range ? {
+                start: { ...parentDoc.lineCounter.linePos(node.range[0]), offset: node.range[0] },
+                end: { ...parentDoc.lineCounter.linePos(node.range[1]), offset: node.range[1] }
+            } : undefined
+        });
+        return ref;
+    }
+
+    const doc = suffixMatches[0];
 
     let current: Node | null | undefined = doc.doc.contents as any;
     for (const part of pathInFile) {

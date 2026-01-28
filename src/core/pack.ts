@@ -12,9 +12,11 @@ export class Pack {
     public rootPath: string;
     public stageIds: Set<string> = new Set();
     public structureFiles: Set<string> = new Set();
+    public structureExtensions: string[];
 
-    constructor(rootPath: string) {
+    constructor(rootPath: string, opts?: { structureExtensions?: string[] }) {
         this.rootPath = path.resolve(rootPath);
+        this.structureExtensions = opts?.structureExtensions?.length ? opts.structureExtensions : ['nbt'];
     }
 
     async load() {
@@ -30,24 +32,56 @@ export class Pack {
         }
 
         const content = readFileSync(packYmlPath, 'utf8');
-        const { parsed, diagnostics } = parseYaml(content, 'pack.yml');
-        this.diagnostics.push(...diagnostics);
+        const { parsed, diagnostics: yamlDiagnostics } = parseYaml(content, 'pack.yml');
+        this.diagnostics.push(...yamlDiagnostics);
+
         if (parsed && parsed.doc.contents) {
             const contents = parsed.doc.contents as any;
-            if (contents.get && contents.get('stages')) {
-                const stages = contents.get('stages', true);
-                if (Array.isArray(stages.items)) {
-                    for (const item of stages.items) {
-                        if (item) {
-                            if (typeof item.value === 'string' || typeof item.value === 'number') {
-                                this.stageIds.add(String(item.value).toUpperCase());
-                            } else if (typeof item.get === 'function') {
-                                const idNode = item.get('id', true);
-                                if (idNode && (typeof idNode.value === 'string' || typeof idNode.value === 'number')) {
-                                    this.stageIds.add(String(idNode.value).toUpperCase());
-                                }
-                            }
+            const stages = contents.get ? contents.get('stages', true) : undefined;
+
+            if (!stages) {
+                this.diagnostics.push({
+                    code: 'PACK_STAGES_MISSING',
+                    message: 'pack.yml has no "stages" key. Stage validation may be incomplete.',
+                    severity: 'warning',
+                    file: 'pack.yml'
+                });
+            } else if (!Array.isArray(stages.items)) {
+                this.diagnostics.push({
+                    code: 'PACK_STAGES_NOT_A_LIST',
+                    message: '"stages" in pack.yml is not a YAML sequence/list.',
+                    severity: 'warning',
+                    file: 'pack.yml',
+                    range: stages.range ? {
+                        start: { ...parsed.lineCounter.linePos(stages.range[0]), offset: stages.range[0] },
+                        end: { ...parsed.lineCounter.linePos(stages.range[1]), offset: stages.range[1] }
+                    } : undefined
+                });
+            } else {
+                for (const item of stages.items) {
+                    let stageId: string | undefined;
+                    if (item && (typeof item.value === 'string' || typeof item.value === 'number')) {
+                        stageId = String(item.value);
+                    } else if (item && typeof item.get === 'function') {
+                        const idNode = item.get('id', true);
+                        if (idNode && (typeof idNode.value === 'string' || typeof idNode.value === 'number')) {
+                            stageId = String(idNode.value);
                         }
+                    }
+
+                    if (stageId) {
+                        this.stageIds.add(stageId.toUpperCase());
+                    } else if (item) {
+                        this.diagnostics.push({
+                            code: 'PACK_STAGE_UNREADABLE',
+                            message: 'A stage entry in pack.yml could not be interpreted as a stage id (expected scalar or map with "id").',
+                            severity: 'warning',
+                            file: 'pack.yml',
+                            range: item.range ? {
+                                start: { ...parsed.lineCounter.linePos(item.range[0]), offset: item.range[0] },
+                                end: { ...parsed.lineCounter.linePos(item.range[1]), offset: item.range[1] }
+                            } : undefined
+                        });
                     }
                 }
             }
@@ -73,7 +107,8 @@ export class Pack {
         // Load structure files
         const structPath = path.join(this.rootPath, 'structures');
         if (existsSync(structPath)) {
-            const structFiles = await fg('**/*.{nbt,terra,tesf}', { cwd: structPath });
+            const extPart = this.structureExtensions.map(e => e.replace(/^\./, '')).join(',');
+            const structFiles = await fg(`**/*.{${extPart}}`, { cwd: structPath });
             for (const f of structFiles) {
                 this.structureFiles.add(f.toUpperCase().replace(/\\/g, '/'));
             }

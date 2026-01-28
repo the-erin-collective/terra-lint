@@ -17,8 +17,14 @@ program
     .option('--strict', 'Treat warnings as errors', false)
     .option('--json', 'Output report in JSON format', false)
     .option('--max-warnings <number>', 'Maximum number of warnings allowed', '-1')
+    .option('--structure-ext <csv>', 'Comma-separated structure extensions (no dots), e.g. "nbt,tesf", "nbt"', 'nbt')
     .action(async (packRoot: string, options: any) => {
-        const pack = new Pack(packRoot);
+        const exts = String(options.structureExt || 'nbt')
+            .split(',')
+            .map((s: string) => s.trim().replace(/^\./, ''))
+            .filter(Boolean);
+
+        const pack = new Pack(packRoot, { structureExtensions: exts });
         console.log(`Linting pack at: ${pack.rootPath}`);
 
         await pack.load();
