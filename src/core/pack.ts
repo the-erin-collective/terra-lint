@@ -45,8 +45,19 @@ export class Pack {
         const biomes = this.registry.getObjectsByType('BIOME');
         for (const biome of biomes) {
             try {
-                // This will trigger EXTENDS_TARGET_MISSING diagnostics if any
-                this.registry.getEffectiveObject('BIOME', biome.id, this);
+                const effective = this.registry.getEffectiveObject('BIOME', biome.id, this);
+
+                if (effective.palette) {
+                    this.validatePalette(effective.palette, biome.parsedYaml.filePath);
+                }
+                if (effective.slant) {
+                    for (const item of effective.slant) {
+                        if (item.palette) {
+                            this.validatePalette(item.palette, biome.parsedYaml.filePath);
+                        }
+                    }
+                }
+
             } catch (e: any) {
                 this.diagnostics.push({
                     code: 'EXTENDS_CYCLE',
@@ -54,6 +65,45 @@ export class Pack {
                     severity: 'error',
                     file: biome.parsedYaml.filePath
                 });
+            }
+        }
+    }
+
+    private validatePalette(palette: any, filePath: string) {
+        if (!Array.isArray(palette)) {
+            this.diagnostics.push({
+                code: 'INVALID_PALETTE_STRUCTURE',
+                message: 'Palette must be a sequence of layers.',
+                severity: 'error',
+                file: filePath
+            });
+            return;
+        }
+
+        for (const layer of palette) {
+            if (typeof layer === 'object' && layer !== null && !Array.isArray(layer)) {
+                const keys = Object.keys(layer);
+                if (keys.length > 1) {
+                    this.diagnostics.push({
+                        code: 'INVALID_PALETTE_LAYER',
+                        message: `Palette layer has multiple keys: [${keys.join(', ')}]. Each layer should be a single block/palette reference. (Likely caused by incorrect <<: merge in a list)`,
+                        severity: 'error',
+                        file: filePath
+                    });
+                } else if (keys.length === 1) {
+                    const id = keys[0];
+                    // If it's not a prefixed block ID (minecraft:...), check if it's a registered palette
+                    if (!id.includes(':')) {
+                        if (!this.registry.getObject('PALETTE', id)) {
+                            this.diagnostics.push({
+                                code: 'PALETTE_MISSING',
+                                message: `Referenced palette "${id}" not found. If this is a block ID, use "minecraft:${id}" or "BLOCK:minecraft:${id}".`,
+                                severity: 'warning', // Warning because it might be a block ID without prefix that Terra supports
+                                file: filePath
+                            });
+                        }
+                    }
+                }
             }
         }
     }

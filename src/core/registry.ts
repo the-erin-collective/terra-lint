@@ -25,8 +25,8 @@ export class Registry {
             const idNode = root.get('id', true);
 
             if (isScalar(typeNode) && isScalar(idNode)) {
-                const typeStr = String(typeNode.value);
-                const idStr = String(idNode.value);
+                const typeStr = String(typeNode.value).toUpperCase();
+                const idStr = String(idNode.value).toUpperCase();
 
                 let typeMap = this.byType.get(typeStr);
                 if (!typeMap) {
@@ -44,9 +44,9 @@ export class Registry {
                 const extNode = root.get('extends', true);
                 if (extNode) {
                     if (isScalar(extNode)) {
-                        obj.extends = String(extNode.value);
+                        obj.extends = String(extNode.value).toUpperCase();
                     } else if (isSeq(extNode)) {
-                        obj.extends = (extNode as any).items.map((item: any) => isScalar(item) ? String(item.value) : '').filter(Boolean);
+                        obj.extends = (extNode as any).items.map((item: any) => isScalar(item) ? String(item.value).toUpperCase() : '').filter(Boolean);
                     }
                 }
 
@@ -56,16 +56,18 @@ export class Registry {
     }
 
     getObjectsByType(type: string): ConfigObject[] {
-        const typeMap = this.byType.get(type);
+        const typeMap = this.byType.get(type.toUpperCase());
         return typeMap ? Array.from(typeMap.values()) : [];
     }
 
     getObject(type: string, id: string): ConfigObject | undefined {
-        return this.byType.get(type)?.get(id);
+        return this.byType.get(type.toUpperCase())?.get(id.toUpperCase());
     }
 
     getEffectiveObject(type: string, id: string, pack: Pack, seen = new Set<string>()): any {
-        const key = `${type}:${id}`;
+        const typeUpper = type.toUpperCase();
+        const idUpper = id.toUpperCase();
+        const key = `${typeUpper}:${idUpper}`;
         if (seen.has(key)) {
             throw new Error(`Circular inheritance detected: ${Array.from(seen).join(' -> ')} -> ${key}`);
         }
@@ -96,7 +98,7 @@ export class Registry {
         }
 
         // Resolve the current object's values
-        const currentResolved = resolveValue(obj.node, obj.parsedYaml.doc as any, obj.parsedYaml);
+        const currentResolved = resolveValue(obj.node, pack, obj.parsedYaml);
 
         return Object.assign(base, currentResolved);
     }

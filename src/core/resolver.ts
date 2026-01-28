@@ -57,6 +57,12 @@ function resolveMetaRef(ref: string, pack: Pack): any {
     let pathStr = ref.substring(1);
     if (pathStr.startsWith('{') && pathStr.endsWith('}')) {
         pathStr = pathStr.substring(1, pathStr.length - 1);
+    } else if (pathStr.includes('{')) {
+        // Handle cases like ${file:path} or ${file:path} - 1
+        const match = pathStr.match(/{([^}]+)}/);
+        if (match) {
+            pathStr = match[1];
+        }
     }
 
     const parts = pathStr.split(':');
