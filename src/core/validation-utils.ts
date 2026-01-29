@@ -1,32 +1,25 @@
+import { parseExpression } from './expr/parser.js';
+import { ExprError } from './expr/ast.js';
+
 export interface ValidationResult {
     isValid: boolean;
-    message?: string;
+    errors?: ExprError[];
+    message?: string; // Kept for backward compat if needed, or derived
 }
 
 /**
- * Sanity-checks a Terra expression for common syntax errors.
- * This is NOT a full parser. It checks:
- * - Balanced parentheses
- * - Balanced absolute value pipes (|...|)
- * 
- * It does NOT validate operator usage, function calls, or the full Paralithic grammar.
+ * Parses and validates a Terra expression using the Paralithic grammar.
  */
 export function validateExpression(expr: string): ValidationResult {
-    // Check balanced parentheses
-    let parenDepth = 0;
-    for (const char of expr) {
-        if (char === '(') parenDepth++;
-        if (char === ')') parenDepth--;
-        if (parenDepth < 0) return { isValid: false, message: 'Unbalanced parentheses: too many closed parentheses' };
+    const result = parseExpression(expr);
+    if (result.ok) {
+        return { isValid: true };
     }
-    if (parenDepth !== 0) return { isValid: false, message: 'Unbalanced parentheses: missing closed parentheses' };
-
-    // Check balanced absolute value pipes (|...|)
-    // Count pipes and ensure they are paired. This is a heuristic, as `||` is also valid (logical OR).
-    const pipeCount = (expr.match(/\|/g) || []).length;
-    if (pipeCount % 2 !== 0) return { isValid: false, message: 'Unbalanced absolute value pipes' };
-
-    return { isValid: true };
+    return {
+        isValid: false,
+        errors: result.errors,
+        message: result.errors.map(e => e.message).join('; ')
+    };
 }
 
 /**

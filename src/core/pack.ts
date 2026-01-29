@@ -6,6 +6,7 @@ import { Registry } from './registry.js';
 import { Diagnostic } from '../types/diagnostic.js';
 import { isMap, isScalar, isSeq } from 'yaml';
 import { BIOME_SCHEMA, FEATURE_SCHEMA, PACK_SCHEMA, validateSchema } from './schema.js';
+import { PValue, toJS } from './pvalue/types.js';
 import { resolveValue } from './resolver.js';
 
 export interface ValidationRules {
@@ -71,7 +72,7 @@ export class Pack {
             if (rule.startsWith('.')) {
                 return pathStr.includes(rule);
             }
-            return fieldName.toLowerCase() === rule.toLowerCase(); // Case-insensitive match for block fields as per original
+            return fieldName && fieldName.toLowerCase() === rule.toLowerCase();
         });
     }
 
@@ -93,7 +94,8 @@ export class Pack {
 
         if (parsed && parsed.doc.contents) {
             const resolvedPack = resolveValue(parsed.doc.contents, this, parsed);
-            validateSchema(resolvedPack.value, PACK_SCHEMA, this, parsed, parsed.doc.contents);
+            const resolvedValue = toJS(resolvedPack);
+            validateSchema(resolvedValue, PACK_SCHEMA, this, parsed, parsed.doc.contents);
 
             const contents = parsed.doc.contents as any;
             const stages = contents.get ? contents.get('stages', true) : undefined;
@@ -325,7 +327,9 @@ export class Pack {
         const biomes = this.registry.getObjectsByType('BIOME');
         for (const biome of biomes) {
             try {
-                const effective = this.registry.getEffectiveObject('BIOME', biome.id, this);
+                const effectiveP = this.registry.getEffectiveObject('BIOME', biome.id, this);
+                if (!effectiveP) continue;
+                const effective = toJS(effectiveP);
                 validateSchema(effective, BIOME_SCHEMA, this, biome.parsedYaml, biome.node);
 
                 if (effective.palette) {
@@ -384,7 +388,9 @@ export class Pack {
         const features = this.registry.getObjectsByType('FEATURE');
         for (const feature of features) {
             try {
-                const effective = this.registry.getEffectiveObject('FEATURE', feature.id, this);
+                const effectiveP = this.registry.getEffectiveObject('FEATURE', feature.id, this);
+                if (!effectiveP) continue;
+                const effective = toJS(effectiveP);
                 validateSchema(effective, FEATURE_SCHEMA, this, feature.parsedYaml, feature.node);
             } catch (e: any) {
                 this.diagnostics.push({

@@ -1,7 +1,8 @@
 import { ParsedYaml } from '../parser/yaml.js';
 import { isMap, isScalar, isSeq } from 'yaml';
 import { resolveValue } from './resolver.js';
-import { Pack } from './pack.js';
+import { PValue, PMap, createPMap } from './pvalue/types.js';
+import type { Pack } from './pack.js';
 
 export interface ConfigObject {
     type: string;
@@ -79,7 +80,7 @@ export class Registry {
         return this.byType.get(type.toUpperCase())?.get(id.toUpperCase());
     }
 
-    getEffectiveObject(type: string, id: string, pack: Pack, seen = new Map<string, string>()): any {
+    getEffectiveObject(type: string, id: string, pack: Pack, seen = new Map<string, string>()): PMap | undefined {
         const typeUpper = type.toUpperCase();
         const idUpper = id.toUpperCase();
         const key = `${typeUpper}:${idUpper}`;
@@ -94,51 +95,47 @@ export class Registry {
         seen.set(key, obj.id);
 
         try {
-            let base: any = {};
-            // Maintain a merged provenance map
-            const baseProvenance: Map<string, any> = new Map();
-            Object.defineProperty(base, '__terra_provenance', { value: baseProvenance, enumerable: false });
+            const combinedItems = new Map<string, PValue>();
 
             if (obj.extends) {
                 const extNode = obj.node.get('extends', true);
                 const parentIds = Array.isArray(obj.extends) ? obj.extends : [obj.extends];
-                // Terra Semantics: earlier extends have higher priority for filling blanks
-                // This means we should merge them in REVERSE order so earlier ones overwrite later ones
+
+                // Terra Semantics: earlier extends have higher priority
+                // We merge in reverse order so earlier ones overwrite later ones
                 for (let i = parentIds.length - 1; i >= 0; i--) {
                     const parentId = parentIds[i];
                     const parentEffective = this.getEffectiveObject(type, parentId, pack, seen);
-                    if (parentEffective) {
-                        // Merge parents: earlier (actually later in reverse loop) overwrite
-                        Object.assign(base, parentEffective);
 
-                        // Merge parent provenance
-                        if (parentEffective.__terra_provenance instanceof Map) {
-                            for (const [k, v] of parentEffective.__terra_provenance.entries()) {
-                                baseProvenance.set(k, v);
-                            }
+                    if (parentEffective && parentEffective.kind === 'map') {
+                        for (const [k, v] of parentEffective.entries) {
+                            combinedItems.set(k, v);
                         }
                     } else {
-                        // Attempt to find range of the specific parentId in YAML
+                        // Attempt to find range of the specific parentId in YAML in case of missing target
                         let range = undefined;
                         if (extNode) {
                             if (isScalar(extNode) && String(extNode.value) === parentId) {
                                 range = extNode.range;
                             } else if (isSeq(extNode)) {
-                                const item = extNode.items[i];
+                                const item = (extNode as any).items[i];
                                 if (item && isScalar(item)) range = item.range;
                             }
                         }
 
-                        pack.diagnostics.push({
-                            code: 'EXTENDS_TARGET_MISSING',
-                            message: `Inheritance target "${parentId}" of type "${typeUpper}" not found.`,
-                            severity: 'error',
-                            file: obj.parsedYaml.filePath,
-                            range: range ? {
-                                start: { ...obj.parsedYaml.lineCounter.linePos(range[0]), offset: range[0] },
-                                end: { ...obj.parsedYaml.lineCounter.linePos(range[1]), offset: range[1] }
-                            } : undefined
-                        });
+                        // Only report if we absolutely can't find it (and it wasn't just not a map)
+                        if (!parentEffective) {
+                            pack.diagnostics.push({
+                                code: 'EXTENDS_TARGET_MISSING',
+                                message: `Inheritance target "${parentId}" of type "${typeUpper}" not found.`,
+                                severity: 'error',
+                                file: obj.parsedYaml.filePath,
+                                range: range ? {
+                                    start: { ...obj.parsedYaml.lineCounter.linePos(range[0]), offset: range[0] },
+                                    end: { ...obj.parsedYaml.lineCounter.linePos(range[1]), offset: range[1] }
+                                } : undefined
+                            });
+                        }
                     }
                 }
             }
@@ -147,21 +144,23 @@ export class Registry {
             const currentResolved = resolveValue(obj.node, pack, obj.parsedYaml);
 
             // Priority Shadowing: child values overwrite parents entirely (shallow merge)
-            const result = Object.assign(base, currentResolved.value);
-
-            // Merge child provenance (overwrites parent provenance for same keys)
-            // currentResolved.value might not be an object if simple type, checking just in case
-            if (currentResolved.value && typeof currentResolved.value === 'object') {
-                // Use the provenance map returned by resolveValue if available, or the one attached to value
-                const childProv = currentResolved.provenance || (currentResolved.value as any).__terra_provenance;
-                if (childProv instanceof Map) {
-                    for (const [k, v] of childProv.entries()) {
-                        baseProvenance.set(k, v);
-                    }
+            if (currentResolved.kind === 'map') {
+                for (const [k, v] of currentResolved.entries) {
+                    combinedItems.set(k, v);
                 }
             }
 
-            return result;
+            // Return new PMap with provenance pointing to the definition of this object
+            // The items inside retain their own origins
+            return createPMap(combinedItems, {
+                file: obj.parsedYaml.filePath,
+                range: obj.node.range ? { start: obj.node.range[0], end: obj.node.range[1] } : undefined,
+                fullRange: obj.node.range ? {
+                    start: { ...obj.parsedYaml.lineCounter.linePos(obj.node.range[0]), offset: obj.node.range[0] },
+                    end: { ...obj.parsedYaml.lineCounter.linePos(obj.node.range[1]), offset: obj.node.range[1] }
+                } : undefined
+            });
+
         } finally {
             seen.delete(key);
         }

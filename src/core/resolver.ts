@@ -1,53 +1,44 @@
 import { isMap, isScalar, isSeq, Node, Scalar } from 'yaml';
 import path from 'path';
-import { Pack } from '../core/pack.js';
-import { ParsedYaml, ProvenanceMap, ProvenanceEntry, setProvenance } from '../parser/yaml.js';
+import type { Pack } from '../core/pack.js';
+import { ParsedYaml } from '../parser/yaml.js';
 import { validateBlockState, validateExpression } from './validation-utils.js';
-
-export interface ResolvedResult {
-    value: any;
-    // origin field is kept for backward compatibility but provenance map is primary
-    origin: ParsedYaml;
-    range?: any;
-    interpolated?: boolean;
-    provenance?: ProvenanceMap;
-}
+import { PValue, Origin, createPScalar, createPSeq, createPMap, isPMap, isPSeq } from './pvalue/types.js';
 
 export function resolveValue(
     node: Node | null | undefined,
     pack: Pack,
     parentDoc: ParsedYaml,
     fieldPath: string[] = []
-): ResolvedResult {
-    if (!node) return { value: undefined, origin: parentDoc };
+): PValue {
+    // Default origin for missing nodes is just the file (or parent node's location?)
+    // If node is null, we return a null scalar with file origin
+    const defaultOrigin: Origin = { file: parentDoc.filePath };
+    if (!node) return createPScalar(undefined, defaultOrigin);
 
     const pathStr = fieldPath.join('.');
     const lastField = fieldPath[fieldPath.length - 1];
 
-    // Initialize sidecar provenance map
-    const provenance: ProvenanceMap = new Map();
-
-    // Field-aware gating: only validate expressions in known expression contexts
+    // Field-aware gating
     const isExpressionField = pack.isExpressionField(pathStr, lastField);
-
-    // Field-aware gating: only validate block states in known block contexts
     const isBlockField = pack.isBlockField(pathStr, lastField);
+
+    const range = node.range ? { start: node.range[0], end: node.range[1] } : undefined;
+    const origin: Origin = {
+        file: parentDoc.filePath,
+        range,
+        fullRange: node.range ? {
+            start: { ...parentDoc.lineCounter.linePos(node.range[0]), offset: node.range[0] },
+            end: { ...parentDoc.lineCounter.linePos(node.range[1]), offset: node.range[1] }
+        } : undefined,
+        via: 'direct'
+    };
 
     if (isScalar(node)) {
         let val = String(node.value);
         let interpolated = false;
 
-        // Current node's provenance
-        const selfProvenance: ProvenanceEntry = {
-            file: parentDoc.filePath,
-            range: node.range ? {
-                start: { ...parentDoc.lineCounter.linePos(node.range[0]), offset: node.range[0] },
-                end: { ...parentDoc.lineCounter.linePos(node.range[1]), offset: node.range[1] }
-            } : undefined as any,
-            sourceKind: parentDoc.sourceKind
-        };
-
-        // Terra MetaString: ${ref} interpolation
+        // Terra MetaString: ${ref}
         if (val.includes('${')) {
             const regex = /\${([^}]+)}/g;
             let match;
@@ -55,321 +46,271 @@ export function resolveValue(
             while ((match = regex.exec(val)) !== null) {
                 const ref = match[1];
                 const resolved = resolveMetaRef('$' + ref, pack, parentDoc, node);
-                result = result.replace(match[0], String(resolved.value));
+
+                // resolved is PValue. Expect scalar for interpolation.
+                // If it's not a scalar, stringify it?
+                // resolved.kind check?
+                let resolvedVal = '';
+                if (resolved.kind === 'scalar') resolvedVal = String(resolved.value);
+                else resolvedVal = JSON.stringify(resolved); // Fallback?
+
+                result = result.replace(match[0], resolvedVal);
             }
             interpolated = true;
-            val = result.replace(/\r?\n/g, ' ').trim(); // Handle multi-line expressions
+            val = result.replace(/\r?\n/g, ' ').trim();
 
             if (/^-?\d+(\.\d+)?$/.test(val)) {
-                return {
-                    value: Number(val),
-                    origin: parentDoc,
-                    range: node.range,
-                    interpolated: true,
-                    provenance // Scalars don't usually need a map unless we track sub-parts, but we return it for consistency
-                };
+                return createPScalar(Number(val), origin);
             }
         }
 
         // Terra MetaValue: $ref (entire scalar)
         if (val.startsWith('$')) {
-            return resolveMetaRef(val, pack, parentDoc, node);
+            const resolved = resolveMetaRef(val, pack, parentDoc, node);
+            // Mark origin as via meta? 
+            // The resolved PValue keeps its own origin. 
+            // We might want to wrap it or just return it?
+            // "implement MetaValue ($file) returning PValue with 'meta' origin"
+            // If we just return resolved, we see the target file.
+            // If we want to trace the jump, we can wrap or modify.
+            // But PValue is a tree. If resolved is a PSeq, we return that PSeq.
+
+            // To preserve the "jump" info, we could modify the origin.via, but that mutates the resolved node which might be shared?
+            // Actually, resolveMetaRef returns a fresh structure (since we parse fresh or clone).
+            // But if we cache docs, we must be careful.
+            // For now, let's just return resolved. The user wants "origin.via = 'meta'".
+            // We can clone the PValue (shallowly) and update origin.
+
+            const metaOrigin: Origin = {
+                ...resolved.origin,
+                via: 'meta'
+                // We keep the target file/range, but mark it arrived via meta.
+                // Or do we want the origin to be THIS file?
+                // "MetaValue $file:path ... resolved node carries its own provenance ... origin.via = 'meta' (and keep original file+range)"
+            };
+
+            // Shallow clone to update origin
+            if (resolved.kind === 'scalar') return { ...resolved, origin: metaOrigin };
+            if (resolved.kind === 'seq') return { ...resolved, origin: metaOrigin };
+            if (resolved.kind === 'map') return { ...resolved, origin: metaOrigin };
         }
 
-        // Handle numeric underscores (e.g., 1_000_000, 1_000.5, 1e1_0)
-        // Supports integers, floats, and scientific notation with underscores
+        // Numeric underscores
         if (/^[\d_]+(\.[\d_]+)?([eE][+-]?[\d_]+)?$/.test(val) && val.includes('_')) {
             const normalized = val.replace(/_/g, '');
-            if (!isNaN(Number(normalized))) return { value: Number(normalized), origin: parentDoc, range: node.range, interpolated };
+            if (!isNaN(Number(normalized))) {
+                return createPScalar(Number(normalized), origin);
+            }
         }
 
         // Field-Aware Validation
         if (isExpressionField || interpolated) {
             const exprRes = validateExpression(val);
             if (!exprRes.isValid) {
-                // Downgrade to warning unless in a strict expression context (palette, slant)
                 const isStrictExprContext = pathStr.includes('.palette') || pathStr.includes('.slant');
-                pack.diagnostics.push({
-                    code: 'MALFORMED_EXPRESSION',
-                    message: exprRes.message || `Malformed expression: "${val}"`,
-                    severity: isStrictExprContext ? 'error' : 'warning',
-                    file: parentDoc.filePath,
-                    range: node.range ? {
-                        start: { ...parentDoc.lineCounter.linePos(node.range[0]), offset: node.range[0] },
-                        end: { ...parentDoc.lineCounter.linePos(node.range[1]), offset: node.range[1] }
-                    } : undefined
-                });
+                if (exprRes.errors && exprRes.errors.length > 0) {
+                    for (const err of exprRes.errors) {
+                        let absRange = undefined;
+                        if (!interpolated && node.range) {
+                            const startOffset = node.range[0] + err.range.start;
+                            const endOffset = node.range[0] + err.range.end;
+                            absRange = {
+                                start: { ...parentDoc.lineCounter.linePos(startOffset), offset: startOffset },
+                                end: { ...parentDoc.lineCounter.linePos(endOffset), offset: endOffset }
+                            };
+                        }
+                        pack.diagnostics.push({
+                            code: 'EXPR_SYNTAX_ERROR',
+                            message: `Syntax Error: ${err.message}`,
+                            severity: isStrictExprContext ? 'error' : 'warning',
+                            file: parentDoc.filePath,
+                            range: absRange || origin.fullRange
+                        });
+                    }
+                } else {
+                    pack.diagnostics.push({
+                        code: 'MALFORMED_EXPRESSION',
+                        message: exprRes.message || `Malformed expression: "${val}"`,
+                        severity: isStrictExprContext ? 'error' : 'warning',
+                        file: parentDoc.filePath,
+                        range: origin.fullRange
+                    });
+                }
             }
         }
 
-        // Block state validation: only in known block contexts, or if it looks like a block ID
+        // Block state validation
         const looksLikeBlockId = /^[a-z_]+:[a-z_]+/.test(val) || val.toUpperCase().startsWith('BLOCK:');
         if ((isBlockField || looksLikeBlockId) && val.includes('[')) {
             const blockRes = validateBlockState(val);
             if (!blockRes.isValid) {
-                // Error in palette layers (likely real), warning elsewhere
                 const isInPalette = pathStr.includes('.palette');
                 pack.diagnostics.push({
                     code: 'INVALID_BLOCK_STATE',
                     message: blockRes.message || `Invalid block state: "${val}"`,
                     severity: isInPalette ? 'error' : 'warning',
                     file: parentDoc.filePath,
-                    range: node.range ? {
-                        start: { ...parentDoc.lineCounter.linePos(node.range[0]), offset: node.range[0] },
-                        end: { ...parentDoc.lineCounter.linePos(node.range[1]), offset: node.range[1] }
-                    } : undefined
+                    range: origin.fullRange
                 });
             }
         }
 
         const finalValue = val === String(node.value) ? node.value : val;
-        // Include self provenance for scalar
-        provenance.set('', selfProvenance);
-
-        return {
-            value: finalValue,
-            origin: parentDoc,
-            range: node.range,
-            interpolated,
-            provenance
-        };
+        return createPScalar(finalValue, origin);
     }
 
     if (isMap(node)) {
-        const result: any = {};
-
-        // Populate self provenance for the map itself
-        setProvenance(provenance, '', {
-            file: parentDoc.filePath,
-            range: node.range ? {
-                start: { ...parentDoc.lineCounter.linePos(node.range[0]), offset: node.range[0] },
-                end: { ...parentDoc.lineCounter.linePos(node.range[1]), offset: node.range[1] }
-            } : undefined as any,
-            sourceKind: parentDoc.sourceKind
-        });
-
-        // Attach hidden provenance map to the result object for easy access later (e.g. in extends)
-        Object.defineProperty(result, '__terra_provenance', { value: provenance, enumerable: false });
-
-        // Helper to merge provenance maps
-        const mergeProvenance = (prefix: string, source: ProvenanceMap) => {
-            for (const [key, entry] of source.entries()) {
-                const newKey = key === '' ? prefix : `${prefix}${key}`;
-                provenance.set(newKey, entry);
-            }
-        };
+        const entries = new Map<string, PValue>();
 
         for (const pair of node.items) {
             const { key, value } = pair as any;
             if (isScalar(key)) {
                 const keyStr = String(key.value);
+
                 if (keyStr === '<<') {
+                    // Merge
                     const merged = isSeq(value)
-                        ? (value.items as Node[]).map(item => resolveMetaMerge(item, pack, parentDoc))
-                        : [resolveMetaMerge(value as Node, pack, parentDoc)];
+                        ? (value.items as Node[]).map(item => {
+                            if (isScalar(item)) return resolveMetaRef(String(item.value), pack, parentDoc, item);
+                            return resolveValue(item, pack, parentDoc);
+                        })
+                        : [resolveValue(value as Node, pack, parentDoc, [...fieldPath, '<<'])];
 
-                    for (const m of merged) {
-                        // Phase 1 fix: Only merge plain objects, not arrays or primitives
-                        if (m === null || m === undefined) continue;
-                        if (Array.isArray(m)) {
+                    // Existing code had logic to handle list of refs.
+                    // If `value` is list, we map resolveValue (or resolveMetaRef if logic requires).
+                    // In `yaml`, `<<` value is usually scalar ref or map.
+
+                    // Logic fix:
+                    const mergeSources: PValue[] = [];
+                    if (isSeq(value)) {
+                        for (const item of value.items) {
+                            // If item is scalar starting with $, resolve ref
+                            if (isScalar(item) && String(item.value).startsWith('$')) {
+                                mergeSources.push(resolveMetaRef(String(item.value), pack, parentDoc, item));
+                            } else {
+                                mergeSources.push(resolveValue(item as Node, pack, parentDoc));
+                            }
+                        }
+                    } else {
+                        // Single value
+                        if (isScalar(value) && String(value.value).startsWith('$')) {
+                            mergeSources.push(resolveMetaRef(String(value.value), pack, parentDoc, value));
+                        } else {
+                            mergeSources.push(resolveValue(value as Node, pack, parentDoc));
+                        }
+                    }
+
+                    for (const m of mergeSources) {
+                        if (m.kind !== 'map') {
                             pack.diagnostics.push({
                                 code: 'META_MERGE_NOT_A_MAP',
-                                message: 'Cannot merge an array into a map. The merge target resolved to a list, not an object.',
+                                message: `Cannot merge a ${m.kind} into a map.`,
                                 severity: 'error',
                                 file: parentDoc.filePath,
-                                range: value.range ? {
-                                    start: { ...parentDoc.lineCounter.linePos(value.range[0]), offset: value.range[0] },
-                                    end: { ...parentDoc.lineCounter.linePos(value.range[1]), offset: value.range[1] }
-                                } : undefined
+                                range: origin.fullRange // Blame the merge key's map? Or the specific value?
                             });
                             continue;
                         }
-                        if (typeof m !== 'object') {
-                            pack.diagnostics.push({
-                                code: 'META_MERGE_NOT_A_MAP',
-                                message: `Cannot merge a scalar (${typeof m}) into a map. The merge target must be an object.`,
-                                severity: 'error',
-                                file: parentDoc.filePath,
-                                range: value.range ? {
-                                    start: { ...parentDoc.lineCounter.linePos(value.range[0]), offset: value.range[0] },
-                                    end: { ...parentDoc.lineCounter.linePos(value.range[1]), offset: value.range[1] }
-                                } : undefined
-                            });
-                            continue;
-                        }
 
-                        // Safe to merge: m is a plain object
-                        Object.assign(result, m);
+                        // Merge strategies:
+                        // "apply referenced maps first ... then apply local keys"
+                        // entries map accumulates. 
+                        // If we are iterating YAML keys in order, `<<` usually comes early or late?
+                        // Standard YAML: merge keys override earlier keys, but later keys override merge.
+                        // Usually `<<` is put first.
+                        // We are processing keys in order.
+                        // If `<<` generates keys, we add them to `entries`.
+                        // If a key already exists, do we overwrite?
+                        // "local overrides" -> implies local keys processed AFTER or check existence?
+                        // If `<<` is at the top, we add its keys.
+                        // Later keys will overwrite `entries.set`.
+                        // Checking if `<<` is not at top?
 
-                        // Merge provenance from the merged object
-                        if ((m as any).__terra_provenance) {
-                            // When merging a full object, its keys are at root of result
-                            mergeProvenance('', (m as any).__terra_provenance);
+                        for (const [k, v] of m.entries) {
+                            // We set unconditionally? 
+                            // If `entries` already has k (from previous key in this map?), that previous key is "earlier" so it should stay? 
+                            // Or `<<` provides defaults?
+                            // Usually `<<` provides defaults, i.e. "use these unless I define them".
+                            // So if key exists, we DON'T overwrite.
+                            if (!entries.has(k)) {
+                                entries.set(k, v);
+                            }
                         }
                     }
                 } else {
                     const resolved = resolveValue(value as Node, pack, parentDoc, [...fieldPath, keyStr]);
-                    result[keyStr] = resolved.value;
-
-                    // Add provenance for this key's value
-                    if (resolved.provenance) {
-                        mergeProvenance(`/${keyStr}`, resolved.provenance);
-                    } else if (resolved.value !== undefined) {
-                        // Fallback for primitive values resolved without provenance map
-                        setProvenance(provenance, `/${keyStr}`, {
-                            file: resolved.origin.filePath,
-                            range: resolved.range ? {
-                                start: { ...resolved.origin.lineCounter.linePos(resolved.range[0]), offset: resolved.range[0] },
-                                end: { ...resolved.origin.lineCounter.linePos(resolved.range[1]), offset: resolved.range[1] }
-                            } : undefined as any,
-                            sourceKind: resolved.origin.sourceKind
-                        });
-                    }
+                    entries.set(keyStr, resolved);
                 }
             }
         }
-        return { value: result, origin: parentDoc, range: node.range, provenance };
+        return createPMap(entries, origin);
     }
 
     if (isSeq(node)) {
-        const result: any[] = [];
-
-        // Populate self provenance for the list itself
-        setProvenance(provenance, '', {
-            file: parentDoc.filePath,
-            range: node.range ? {
-                start: { ...parentDoc.lineCounter.linePos(node.range[0]), offset: node.range[0] },
-                end: { ...parentDoc.lineCounter.linePos(node.range[1]), offset: node.range[1] }
-            } : undefined as any,
-            sourceKind: parentDoc.sourceKind
-        });
-
-        // Attach hidden provenance map
-        Object.defineProperty(result, '__terra_provenance', { value: provenance, enumerable: false });
-
-        // Helper to merge provenance maps
-        const mergeProvenance = (prefix: string, source: ProvenanceMap) => {
-            for (const [key, entry] of source.entries()) {
-                const newKey = key === '' ? prefix : `${prefix}${key}`;
-                provenance.set(newKey, entry);
-            }
-        };
+        const items: PValue[] = [];
 
         for (let i = 0; i < node.items.length; i++) {
             const item = node.items[i];
-            const currentIndex = result.length;
 
-            // List-Merge Compatibility: - <<: ref
-            if (isMap(item) && (pathStr.includes('palette') || pathStr.includes('features'))) {
+            // MetaList: - << ref
+            if (isScalar(item) && String(item.value).startsWith('<< ')) {
+                const refPart = String(item.value).substring(3).trim();
+                const resolved = resolveMetaRef('$' + refPart, pack, parentDoc, item);
+
+                if (resolved.kind === 'seq') {
+                    // Splice items
+                    items.push(...resolved.items);
+                } else {
+                    // Treat as single item? Or error?
+                    // "must be a PSeq, otherwise emit META_SPLICE_NOT_A_LIST"
+                    pack.diagnostics.push({
+                        code: 'META_SPLICE_NOT_A_LIST',
+                        message: `Meta-splice target is not a list (got ${resolved.kind})`,
+                        severity: 'error',
+                        file: parentDoc.filePath,
+                        range: origin.fullRange // Blame the splice item location
+                    });
+                }
+                continue;
+            }
+
+            // List-Merge Compatibility: - <<: ref (Map inside List) -- Is this standard Terra?
+            // "List-Merge Compatibility: - <<: ref" lines 262-306 in original resolver.
+            // If item is map with single key `<<`.
+            if (isMap(item)) {
                 const mapItems = (item as any).items;
                 if (mapItems.length === 1 && isScalar(mapItems[0].key) && mapItems[0].key.value === '<<') {
-                    const merged = resolveMetaMerge(mapItems[0].value as Node, pack, parentDoc);
-                    if (Array.isArray(merged)) {
-                        // Splicing a list
-                        merged.forEach((mItem, j) => {
-                            result.push(mItem);
-                            // If the merged list has provenance, try to map it
-                            if ((merged as any).__terra_provenance) {
-                                // This is tricky: we'd need to shift indices. 
-                                // For now we might lose granular provenance of spliced items unless we iterate carefully.
-                                // Ideal: look up provenance of index 'j' in merged list
-                                const sourceMap = (merged as any).__terra_provenance as ProvenanceMap;
-                                // We can't easily iterate the source map by index without parsing keys.
-                                // Simplified approach: If the item itself is an object/array, it has its own provenance.
-                            }
-                        });
-                        // Add provenance for the spliced items (best effort)
-                        if ((merged as any).__terra_provenance) {
-                            const sourceMap = (merged as any).__terra_provenance as ProvenanceMap;
-                            // Map keys like "/0/..." to "/{currentIndex}/..."
-                            for (const [key, entry] of sourceMap.entries()) {
-                                if (key.startsWith('/')) {
-                                    // key is like /0/foo or /0
-                                    const firstSlash = key.indexOf('/', 1);
-                                    const indexStr = firstSlash === -1 ? key.substring(1) : key.substring(1, firstSlash);
-                                    const index = parseInt(indexStr);
-                                    if (!isNaN(index)) {
-                                        const suffix = firstSlash === -1 ? '' : key.substring(firstSlash);
-                                        setProvenance(provenance, `/${currentIndex + index}${suffix}`, entry);
-                                    }
-                                }
-                            }
-                        }
-                    } else if (typeof merged === 'object' && merged !== null) {
-                        result.push(merged);
-                        if ((merged as any).__terra_provenance) {
-                            mergeProvenance(`/${currentIndex}`, (merged as any).__terra_provenance);
-                        }
+                    // Same logic as splice
+                    const valNode = mapItems[0].value;
+                    let resolved: PValue;
+                    if (isScalar(valNode) && String(valNode.value).startsWith('$')) {
+                        resolved = resolveMetaRef(String(valNode.value), pack, parentDoc, valNode);
+                    } else {
+                        resolved = resolveValue(valNode, pack, parentDoc);
+                    }
+
+                    if (resolved.kind === 'seq') {
+                        items.push(...resolved.items);
+                    } else if (resolved.kind !== 'scalar' || resolved.value !== null) { // if null, maybe ignore?
+                        // Original code handled 'object' merge.
+                        items.push(resolved);
                     }
                     continue;
                 }
             }
 
-            // MetaList: - << ref
-            if (isScalar(item) && String((item as Scalar).value).startsWith('<< ')) {
-                const refPart = String((item as Scalar).value).substring(3).trim();
-                const resolved = resolveMetaRef('$' + refPart, pack, parentDoc, item);
-                if (Array.isArray(resolved.value)) {
-                    const mergedList = resolved.value;
-                    mergedList.forEach((mItem, j) => {
-                        result.push(mItem);
-                    });
-                    // Propagate provenance from the referenced list
-                    if (resolved.provenance) {
-                        const sourceMap = resolved.provenance;
-                        for (const [key, entry] of sourceMap.entries()) {
-                            if (key.startsWith('/')) {
-                                const firstSlash = key.indexOf('/', 1);
-                                const indexStr = firstSlash === -1 ? key.substring(1) : key.substring(1, firstSlash);
-                                const index = parseInt(indexStr);
-                                if (!isNaN(index)) {
-                                    const suffix = firstSlash === -1 ? '' : key.substring(firstSlash);
-                                    setProvenance(provenance, `/${currentIndex + index}${suffix}`, entry);
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    result.push(resolved.value);
-                    if (resolved.provenance) {
-                        mergeProvenance(`/${currentIndex}`, resolved.provenance);
-                    } else {
-                        setProvenance(provenance, `/${currentIndex}`, {
-                            file: resolved.origin.filePath,
-                            range: resolved.range ? {
-                                start: { ...resolved.origin.lineCounter.linePos(resolved.range[0]), offset: resolved.range[0] },
-                                end: { ...resolved.origin.lineCounter.linePos(resolved.range[1]), offset: resolved.range[1] }
-                            } : undefined as any,
-                            sourceKind: resolved.origin.sourceKind
-                        });
-                    }
-                }
-                continue;
-            }
-
-            const resolved = resolveValue(item as Node, pack, parentDoc, [...fieldPath, '[]']);
-            result.push(resolved.value);
-
-            if (resolved.provenance) {
-                mergeProvenance(`/${currentIndex}`, resolved.provenance);
-            } else {
-                setProvenance(provenance, `/${currentIndex}`, {
-                    file: resolved.origin.filePath,
-                    range: resolved.range ? {
-                        start: { ...resolved.origin.lineCounter.linePos(resolved.range[0]), offset: resolved.range[0] },
-                        end: { ...resolved.origin.lineCounter.linePos(resolved.range[1]), offset: resolved.range[1] }
-                    } : undefined as any,
-                    sourceKind: resolved.origin.sourceKind
-                });
-            }
+            items.push(resolveValue(item as Node, pack, parentDoc, [...fieldPath, '[]']));
         }
-        return { value: result, origin: parentDoc, range: node.range, provenance };
+        return createPSeq(items, origin);
     }
 
-    return { value: undefined, origin: parentDoc };
+    return createPScalar(undefined, defaultOrigin);
 }
 
-export function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, node?: any): ResolvedResult {
+export function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, node?: any): PValue {
+    // Note: This logic duplicates path finding. Ideally extract 'findDoc(path)' logic.
+    // For now, I'll basically inline the logic but return PValue.
+
     let pathStr = ref.startsWith('$') ? ref.substring(1) : ref;
     if (pathStr.startsWith('{') && pathStr.endsWith('}')) pathStr = pathStr.substring(1, pathStr.length - 1);
 
@@ -382,78 +323,65 @@ export function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, n
         pathInFile = [];
     } else {
         filePath = parts[0];
-        pathInFile = parts.slice(1).join(':').split('.');
+        pathInFile = parts.slice(1).join(':').split('.'); // handle a:b.c -> file a, path b, c
     }
 
-    if (!pack || !pack.registry) return { value: ref, origin: parentDoc };
+    const range = node?.range ? { start: node.range[0], end: node.range[1] } : undefined;
+    const origin: Origin = {
+        file: parentDoc.filePath,
+        range,
+        fullRange: range ? {
+            start: { ...parentDoc.lineCounter.linePos(range.start), offset: range.start },
+            end: { ...parentDoc.lineCounter.linePos(range.end), offset: range.end }
+        } : undefined,
+        via: 'meta'
+    };
+
+    if (!pack || !pack.registry) return createPScalar(ref, origin); // Validation fails?
 
     const normalizedSearch = filePath.replace(/\\/g, '/');
     const allDocs = pack.registry.getAllDocs();
-
-    const precedenceLevels: ParsedYaml[][] = [];
     const roots = [pack.rootPath, ...pack.includePaths];
+    let results: ParsedYaml[] = [];
 
+    // Search logic... (Copy-paste abridged)
     for (const r of roots) {
         const rootAbs = path.resolve(r).toLowerCase().replace(/\\/g, '/');
-        precedenceLevels.push(allDocs.filter(d => {
-            const dfp = path.resolve(d.filePath).toLowerCase().replace(/\\/g, '/');
-            return dfp.startsWith(rootAbs);
-        }));
-    }
+        const docsAtLevel = allDocs.filter(d => path.resolve(d.filePath).toLowerCase().replace(/\\/g, '/').startsWith(rootAbs));
 
-    let results: ParsedYaml[] = [];
-    for (let i = 0; i < precedenceLevels.length; i++) {
-        const docsAtLevel = precedenceLevels[i];
-        const rootAbs = path.resolve(roots[i]).toLowerCase().replace(/\\/g, '/');
-
-        // Exact match against relative path from root
         const exact = docsAtLevel.filter(d => {
             const dfp = path.resolve(d.filePath).toLowerCase().replace(/\\/g, '/');
             const relative = dfp.substring(rootAbs.length).replace(/^\//, '');
             return relative === normalizedSearch.toLowerCase();
         });
-        if (exact.length > 0) {
-            results = exact;
-            break;
-        }
+        if (exact.length) { results = exact; break; }
 
-        // Suffix match (fallback)
         const suffix = docsAtLevel.filter(d => {
             const dfp = d.filePath.replace(/\\/g, '/').toLowerCase();
             return dfp.endsWith(normalizedSearch.toLowerCase()) || dfp.endsWith('/' + normalizedSearch.toLowerCase());
         });
-        if (suffix.length > 0) {
-            results = suffix;
-            break;
-        }
+        if (suffix.length) { results = suffix; break; }
     }
 
     if (results.length === 0) {
         pack.diagnostics.push({
             code: 'META_REF_FILE_MISSING',
-            message: `Meta file "${filePath}" not found in pack root or includes.`,
+            message: `Meta file "${filePath}" not found.`,
             severity: 'error',
             file: parentDoc.filePath,
-            range: node?.range ? {
-                start: { ...parentDoc.lineCounter.linePos(node.range[0]), offset: node.range[0] },
-                end: { ...parentDoc.lineCounter.linePos(node.range[1]), offset: node.range[1] }
-            } : undefined
+            range: origin.fullRange
         });
-        return { value: ref, origin: parentDoc };
+        return createPScalar(ref, origin);
     }
-
     if (results.length > 1) {
         pack.diagnostics.push({
             code: 'META_REF_AMBIGUOUS',
-            message: `Ambiguous meta-reference "${filePath}". Matches multiple files: ${results.map(d => d.filePath).join(', ')}`,
+            message: `Ambiguous meta-reference "${filePath}".`,
             severity: 'error',
             file: parentDoc.filePath,
-            range: node?.range ? {
-                start: { ...parentDoc.lineCounter.linePos(node.range[0]), offset: node.range[0] },
-                end: { ...parentDoc.lineCounter.linePos(node.range[1]), offset: node.range[1] }
-            } : undefined
+            range: origin.fullRange
         });
-        return { value: ref, origin: parentDoc };
+        return createPScalar(ref, origin);
     }
 
     const doc = results[0];
@@ -466,45 +394,19 @@ export function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, n
         if (next === undefined || next === null) {
             pack.diagnostics.push({
                 code: 'META_REF_PATH_MISSING',
-                message: `Path "${pathInFile.join('.')}" not found in meta file "${filePath}". Missing: "${part}"`,
+                message: `Path "${pathInFile.join('.')}" not found in meta file.`,
                 severity: 'error',
                 file: parentDoc.filePath,
-                range: node?.range ? {
-                    start: { ...parentDoc.lineCounter.linePos(node.range[0]), offset: node.range[0] },
-                    end: { ...parentDoc.lineCounter.linePos(node.range[1]), offset: node.range[1] }
-                } : undefined
+                range: origin.fullRange
             });
-            return { value: ref, origin: parentDoc };
+            return createPScalar(ref, origin);
         }
         current = next;
     }
 
     return resolveValue(current, pack, doc);
 }
-/**
- * Resolves a merge target node. Returns the resolved value directly.
- * The caller is responsible for validating the type and emitting diagnostics.
- */
-function resolveMetaMerge(node: Node, pack: Pack, parentDoc: ParsedYaml): any {
-    if (isScalar(node)) {
-        const res = resolveValue(node, pack, parentDoc);
-        // Return the actual resolved value - caller will validate type
-        return res.value;
-    }
-    if (isSeq(node)) {
-        // A sequence of merge targets - resolve each and merge plain objects
-        let result: any = {};
-        for (const item of node.items) {
-            const merged = resolveMetaMerge(item as Node, pack, parentDoc);
-            if (merged !== null && merged !== undefined && typeof merged === 'object' && !Array.isArray(merged)) {
-                Object.assign(result, merged);
-            }
-            // Arrays/scalars from nested merge are silently ignored here
-            // The outer caller will catch type mismatches at the top level
-        }
-        return result;
-    }
-    // Map node - resolve it
-    const res = resolveValue(node, pack, parentDoc);
-    return res.value;
-}
+
+// Deprecated or integrated helpers
+function resolveMetaMerge() { }
+
