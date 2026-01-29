@@ -137,7 +137,7 @@ export function resolveValue(
         }
 
         // Terra MetaValue: $ref (entire scalar)
-        if (val.startsWith('$') && (val.includes('.yml') || val.includes('.yaml') || val.includes(':'))) {
+        if (val.startsWith('$')) {
             const resolved = resolveMetaRef(val, pack, parentDoc, node);
             
             // Create metaSite information - MetaValue is always from a scalar
@@ -264,8 +264,25 @@ export function resolveValue(
                         // Single value
                         if (isScalar(mergeValue)) {
                             const valueVal = String(mergeValue.value);
-                            const ref = valueVal.startsWith('$') ? valueVal : '$' + valueVal;
-                            mergeSources.push({source: resolveMetaRef(ref, pack, parentDoc, mergeValue), node: mergeValue});
+                            // Only treat as meta ref if it has meta-ref characteristics
+                            if (valueVal.startsWith('$') || valueVal.includes('/') || valueVal.includes(':') || valueVal.includes('.yml') || valueVal.includes('.yaml')) {
+                                const ref = valueVal.startsWith('$') ? valueVal : '$' + valueVal;
+                                mergeSources.push({source: resolveMetaRef(ref, pack, parentDoc, mergeValue), node: mergeValue});
+                            } else {
+                                // Plain scalar - this is an error for map merge
+                                const mergeRange = mergeValue.range ? {
+                                    start: { ...parentDoc.lineCounter.linePos(mergeValue.range[0]), offset: mergeValue.range[0] },
+                                    end: { ...parentDoc.lineCounter.linePos(mergeValue.range[1]), offset: mergeValue.range[1] }
+                                } : undefined;
+                                
+                                pack.diagnostics.push({
+                                    code: 'META_MERGE_NOT_A_MAP',
+                                    message: `Cannot merge a scalar into a map. Expected a map or meta-reference.`,
+                                    severity: 'error',
+                                    file: parentDoc.filePath,
+                                    range: mergeRange
+                                });
+                            }
                         } else {
                             mergeSources.push({source: resolveValue(mergeValue as Node, pack, parentDoc), node: mergeValue});
                         }
@@ -371,7 +388,7 @@ export function resolveValue(
                         } : undefined;
                         
                         pack.diagnostics.push({
-                            code: 'META_MERGE_NOT_A_MAP',
+                            code: 'META_LIST_MERGE_NOT_A_LIST',
                             message: `Cannot merge a ${resolved.kind} into a list.`,
                             severity: 'error',
                             file: parentDoc.filePath,
@@ -560,54 +577,52 @@ function markAsMetaDerived(pvalue: PValue, metaSiteFile: string, metaSiteRange?:
 // Helper function for filesystem fallback
 function tryFilesystemFallback(filePath: string, pack: Pack, parentDoc: ParsedYaml): ParsedYaml | null {
     const roots = [pack.rootPath, ...pack.includePaths];
+    const foundFiles: Array<{path: string, root: string}> = [];
     
+    // First, collect all potential matches to check for ambiguity
     for (const root of roots) {
         // Try exact match first
         let fullPath = path.join(root, filePath);
         if (existsSync(fullPath) && (fullPath.endsWith('.yml') || fullPath.endsWith('.yaml'))) {
-            try {
-                const content = readFileSync(fullPath, 'utf8');
-                const { parsed } = parseYaml(content, fullPath, 'root');
-                if (parsed) {
-                    pack.registry.addParsedDoc(parsed, pack);
-                    return parsed;
-                }
-            } catch (e) {
-                // Continue to next attempt
-            }
+            foundFiles.push({path: fullPath, root});
         }
         
         // Try with .yml extension
         if (!filePath.endsWith('.yml') && !filePath.endsWith('.yaml')) {
             fullPath = path.join(root, filePath + '.yml');
             if (existsSync(fullPath)) {
-                try {
-                    const content = readFileSync(fullPath, 'utf8');
-                    const { parsed } = parseYaml(content, fullPath, 'root');
-                    if (parsed) {
-                        pack.registry.addParsedDoc(parsed, pack);
-                        return parsed;
-                    }
-                } catch (e) {
-                    // Continue to next attempt
-                }
+                foundFiles.push({path: fullPath, root});
             }
             
             // Try with .yaml extension
             fullPath = path.join(root, filePath + '.yaml');
             if (existsSync(fullPath)) {
-                try {
-                    const content = readFileSync(fullPath, 'utf8');
-                    const { parsed } = parseYaml(content, fullPath, 'root');
-                    if (parsed) {
-                        pack.registry.addParsedDoc(parsed, pack);
-                        return parsed;
-                    }
-                } catch (e) {
-                    // Continue to next attempt
-                }
+                foundFiles.push({path: fullPath, root});
             }
         }
+    }
+    
+    // Check for ambiguity
+    if (foundFiles.length > 1) {
+        // Report ambiguity but don't use any of them
+        return null; // Let the main function handle the ambiguity error
+    }
+    
+    if (foundFiles.length === 0) {
+        return null;
+    }
+    
+    // Load the single found file
+    const {path: fullPath} = foundFiles[0];
+    try {
+        const content = readFileSync(fullPath, 'utf8');
+        const { parsed } = parseYaml(content, fullPath, 'root');
+        if (parsed) {
+            pack.registry.addParsedDoc(parsed, pack);
+            return parsed;
+        }
+    } catch (e) {
+        // Continue to return null
     }
     
     return null;
