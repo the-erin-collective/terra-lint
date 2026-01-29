@@ -5,8 +5,8 @@ import { parseYaml, ParsedYaml } from '../parser/yaml.js';
 import { Registry } from './registry.js';
 import { Diagnostic } from '../types/diagnostic.js';
 import { isMap, isScalar, isSeq } from 'yaml';
-import { BIOME_SCHEMA, FEATURE_SCHEMA, PACK_SCHEMA, validateSchema } from './schema.js';
-import { PValue, toJS } from './pvalue/types.js';
+import { BIOME_SCHEMA, FEATURE_SCHEMA, PACK_SCHEMA, validateSchema, validatePValueSchema } from './schema.js';
+import { PValue, toJS, isPScalar, isPSeq, isPMap } from './pvalue/types.js';
 import { resolveValue } from './resolver.js';
 
 export interface ValidationRules {
@@ -94,8 +94,8 @@ export class Pack {
 
         if (parsed && parsed.doc.contents) {
             const resolvedPack = resolveValue(parsed.doc.contents, this, parsed);
-            const resolvedValue = toJS(resolvedPack);
-            validateSchema(resolvedValue, PACK_SCHEMA, this, parsed, parsed.doc.contents);
+            // Use PValue-based validation to get proper authoring kind validation
+            validatePValueSchema(resolvedPack, PACK_SCHEMA, this, parsed, parsed.doc.contents);
 
             const contents = parsed.doc.contents as any;
             const stages = contents.get ? contents.get('stages', true) : undefined;
@@ -329,46 +329,50 @@ export class Pack {
             try {
                 const effectiveP = this.registry.getEffectiveObject('BIOME', biome.id, this);
                 if (!effectiveP) continue;
-                const effective = toJS(effectiveP);
-                validateSchema(effective, BIOME_SCHEMA, this, biome.parsedYaml, biome.node);
+                // Use PValue-based validation to get proper authoring kind validation
+                validatePValueSchema(effectiveP, BIOME_SCHEMA, this, biome.parsedYaml, biome.node);
 
-                if (effective.palette) {
-                    this.validatePalette(effective.palette, biome.parsedYaml);
+                const palette = effectiveP.entries.get('palette');
+                if (palette && isPSeq(palette)) {
+                    this.validatePalettePValue(palette.items, biome.parsedYaml);
                 }
-                if (effective.slant) {
-                    for (const item of effective.slant) {
-                        if (item.palette) {
-                            this.validatePalette(item.palette, biome.parsedYaml);
+                
+                const slant = effectiveP.entries.get('slant');
+                if (slant && isPSeq(slant)) {
+                    for (const item of slant.items) {
+                        if (isPMap(item)) {
+                            const itemPalette = item.entries.get('palette');
+                            if (itemPalette && isPSeq(itemPalette)) {
+                                this.validatePalettePValue(itemPalette.items, biome.parsedYaml);
+                            }
                         }
                     }
                 }
 
                 // Validate stages in features
+                const features = effectiveP.entries.get('features');
                 const featuresNode = biome.node.get('features', true);
-                if (effective.features && typeof effective.features === 'object') {
-                    for (const [stageKey, stageFeatures] of Object.entries(effective.features)) {
+                if (features && isPMap(features)) {
+                    for (const [stageKey, stageFeaturesP] of features.entries) {
                         // Only validate as a stage if it's a list (Terra features are always lists in a stage)
-                        if (Array.isArray(stageFeatures)) {
+                        if (isPSeq(stageFeaturesP)) {
                             let stageRange = undefined;
                             if (featuresNode && isMap(featuresNode)) {
                                 const pair = (featuresNode.items as any[]).find(p => isScalar(p.key) && String(p.key.value) === stageKey);
                                 if (pair) stageRange = pair.key.range;
                             }
 
-                            this.expectStageId(stageKey, biome.parsedYaml, stageRange, 'STAGE_MISSING', effective.features, stageKey);
+                            this.expectStageId(stageKey, biome.parsedYaml, stageRange, 'STAGE_MISSING', toJS(features), stageKey);
 
                             // Find the node for this stage's features list to get item ranges
                             const stageNode = featuresNode && isMap(featuresNode) ? featuresNode.get(stageKey, true) as any : undefined;
-
-                            for (let i = 0; i < stageFeatures.length; i++) {
-                                const featureId = stageFeatures[i];
-                                if (typeof featureId === 'string' && !featureId.includes('${')) {
-                                    let itemRange = undefined;
-                                    if (stageNode && isSeq(stageNode)) {
-                                        const item = (stageNode as any).items[i];
-                                        if (item && isScalar(item)) itemRange = item.range;
-                                    }
-                                    this.validateFeatureReference(featureId, biome.parsedYaml, itemRange, stageFeatures, String(i));
+                            for (let i = 0; i < stageFeaturesP.items.length; i++) {
+                                const featureP = stageFeaturesP.items[i];
+                                if (isPScalar(featureP) && typeof featureP.value === 'string') {
+                                    const featureId = featureP.value;
+                                    const itemNode = stageNode && isSeq(stageNode) ? stageNode.items[i] as any : undefined;
+                                    const itemRange = itemNode?.range;
+                                    this.expectFeatureId(featureId, biome.parsedYaml, itemRange);
                                 }
                             }
                         }
@@ -390,8 +394,8 @@ export class Pack {
             try {
                 const effectiveP = this.registry.getEffectiveObject('FEATURE', feature.id, this);
                 if (!effectiveP) continue;
-                const effective = toJS(effectiveP);
-                validateSchema(effective, FEATURE_SCHEMA, this, feature.parsedYaml, feature.node);
+                // Use PValue-based validation to get proper authoring kind validation
+                validatePValueSchema(effectiveP, FEATURE_SCHEMA, this, feature.parsedYaml, feature.node);
             } catch (e: any) {
                 this.diagnostics.push({
                     code: 'EXTENDS_CYCLE',
@@ -401,6 +405,10 @@ export class Pack {
                 });
             }
         }
+    }
+
+    public expectFeatureId(id: string, doc: ParsedYaml, range?: any, context?: any, fieldName?: string) {
+        return this.validateFeatureReference(id, doc, range, context, fieldName);
     }
 
     private validateFeatureReference(id: string, doc: ParsedYaml, range?: any, context?: any, fieldName?: string) {
@@ -462,6 +470,33 @@ export class Pack {
 
             if (id && !id.includes(':') && !id.includes('${')) {
                 this.expectConfigId('PALETTE', id, biomeDoc, undefined, 'PALETTE_MISSING', palette, String(i));
+            }
+        });
+    }
+
+    private validatePalettePValue(palette: PValue[], biomeDoc: ParsedYaml) {
+        palette.forEach((layerP, i: number) => {
+            let id: string | undefined;
+
+            if (isPScalar(layerP) && typeof layerP.value === 'string') {
+                id = layerP.value;
+            } else if (isPMap(layerP)) {
+                const keys = Array.from(layerP.entries.keys());
+                if (keys.length > 1) {
+                    this.reportDiagnostic(
+                        'INVALID_PALETTE_LAYER',
+                        `Palette layer has multiple keys: [${keys.join(', ')}]. Each layer should be a single block/palette reference. (Likely caused by incorrect <<: merge in a list)`,
+                        'error',
+                        layerP,
+                        biomeDoc
+                    );
+                } else if (keys.length === 1) {
+                    id = keys[0];
+                }
+            }
+
+            if (id && !id.includes(':') && !id.includes('${')) {
+                this.expectConfigId('PALETTE', id, biomeDoc, layerP.origin.fullRange, 'PALETTE_MISSING', palette, String(i));
             }
         });
     }

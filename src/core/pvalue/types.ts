@@ -1,4 +1,6 @@
 
+export type AuthoringKind = "scalar" | "map" | "seq";
+
 export interface Origin {
     file: string;
     range?: { start: number; end: number };
@@ -7,6 +9,17 @@ export interface Origin {
         end: { line: number; col: number; offset: number };
     };
     via?: "direct" | "meta" | "extends";
+    authoring?: {
+        kind: AuthoringKind;
+        scalarType?: "string" | "number" | "boolean" | "null" | "unknown";
+        raw?: string;
+    };
+    metaSite?: {
+        file: string;
+        range?: { start: number; end: number };
+        kind: AuthoringKind;
+        raw?: string;
+    };
 }
 
 export type PScalar = { kind: "scalar"; value: string | number | boolean | null; origin: Origin };
@@ -46,4 +59,17 @@ export function createPSeq(items: PValue[], origin: Origin): PSeq {
 
 export function createPMap(entries: Map<string, PValue>, origin: Origin): PMap {
     return { kind: 'map', entries, origin };
+}
+
+// Helper functions for validation
+export type ValueKind = "scalar" | "map" | "seq";
+
+export function getValidationKind(v: PValue): ValueKind {
+    // if authoring info exists, prefer it
+    return v.origin.authoring?.kind ?? v.kind;
+}
+
+export function isMetaDerived(v: PValue): boolean {
+    // meta ref resolution or metastring result
+    return v.origin.via === "meta" || v.origin.metaSite != null;
 }

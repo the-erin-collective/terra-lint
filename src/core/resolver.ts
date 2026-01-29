@@ -24,6 +24,25 @@ export function resolveValue(
     const isBlockField = pack.isBlockField(pathStr, lastField);
 
     const range = node.range ? { start: node.range[0], end: node.range[1] } : undefined;
+    
+    // Capture authoring kind from YAML node
+    let authoring;
+    if (isScalar(node)) {
+        const scalarType = typeof node.value === 'string' ? 'string' as const :
+                          typeof node.value === 'number' ? 'number' as const :
+                          typeof node.value === 'boolean' ? 'boolean' as const :
+                          node.value === null ? 'null' as const : 'unknown' as const;
+        authoring = {
+            kind: 'scalar' as const,
+            scalarType,
+            raw: String(node.value)
+        };
+    } else if (isMap(node)) {
+        authoring = { kind: 'map' as const };
+    } else if (isSeq(node)) {
+        authoring = { kind: 'seq' as const };
+    }
+    
     const origin: Origin = {
         file: parentDoc.filePath,
         range,
@@ -31,7 +50,8 @@ export function resolveValue(
             start: { ...parentDoc.lineCounter.linePos(node.range[0]), offset: node.range[0] },
             end: { ...parentDoc.lineCounter.linePos(node.range[1]), offset: node.range[1] }
         } : undefined,
-        via: 'direct'
+        via: 'direct',
+        authoring
     };
 
     if (isScalar(node)) {
@@ -72,34 +92,53 @@ export function resolveValue(
             interpolated = true;
             val = out.replace(/\r?\n/g, ' ').trim();
 
+            // Create metaSite for MetaString interpolation
+            const metaSite = {
+                file: parentDoc.filePath,
+                range: node.range ? { start: node.range[0], end: node.range[1] } : undefined,
+                kind: 'scalar' as const,
+                raw: String(node.value)
+            };
+
+            // Update origin for interpolated result
+            const metaStringOrigin: Origin = {
+                ...origin,
+                via: 'meta',
+                metaSite,
+                authoring: {
+                    kind: 'scalar' as const,
+                    scalarType: typeof val === 'string' ? 'string' :
+                                typeof val === 'number' ? 'number' :
+                                typeof val === 'boolean' ? 'boolean' :
+                                val === null ? 'null' : 'unknown',
+                    raw: val
+                }
+            };
+
             if (/^-?\d+(\.\d+)?$/.test(val)) {
-                return createPScalar(Number(val), origin);
+                return createPScalar(Number(val), metaStringOrigin);
             }
+            return createPScalar(val, metaStringOrigin);
         }
 
         // Terra MetaValue: $ref (entire scalar)
         if (val.startsWith('$') && (val.includes('.yml') || val.includes('.yaml') || val.includes(':'))) {
             const resolved = resolveMetaRef(val, pack, parentDoc, node);
-            // Mark origin as via meta? 
-            // The resolved PValue keeps its own origin. 
-            // We might want to wrap it or just return it?
-            // "implement MetaValue ($file) returning PValue with 'meta' origin"
-            // If we just return resolved, we see the target file.
-            // If we want to trace the jump, we can wrap or modify.
-            // But PValue is a tree. If resolved is a PSeq, we return that PSeq.
+            
+            // Create metaSite information
+            const metaSite = {
+                file: parentDoc.filePath,
+                range: node.range ? { start: node.range[0], end: node.range[1] } : undefined,
+                kind: 'scalar' as const,
+                raw: String(node.value)
+            };
 
-            // To preserve the "jump" info, we could modify the origin.via, but that mutates the resolved node which might be shared?
-            // Actually, resolveMetaRef returns a fresh structure (since we parse fresh or clone).
-            // But if we cache docs, we must be careful.
-            // For now, let's just return resolved. The user wants "origin.via = 'meta'".
-            // We can clone the PValue (shallowly) and update origin.
-
+            // Shallow clone to update origin while preserving authoring
             const metaOrigin: Origin = {
                 ...resolved.origin,
-                via: 'meta'
-                // We keep the target file/range, but mark it arrived via meta.
-                // Or do we want the origin to be THIS file?
-                // "MetaValue $file:path ... resolved node carries its own provenance ... origin.via = 'meta' (and keep original file+range)"
+                via: 'meta',
+                metaSite
+                // Keep resolved.origin.authoring intact - it belongs to the referenced file's node
             };
 
             // Shallow clone to update origin
