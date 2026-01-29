@@ -1,6 +1,6 @@
 {
   "name": "terra-lint",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "bin": {
     "terra-lint": "./dist/index.js"

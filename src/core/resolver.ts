@@ -195,9 +195,9 @@ export function resolveValue(
                             if (isScalar(item)) {
                                 const itemVal = String(item.value);
                                 const ref = itemVal.startsWith('$') ? itemVal : '$' + itemVal;
-                                mergeSources.push({source: resolveMetaRef(ref, pack, parentDoc, item), node: item});
+                                mergeSources.push({source: resolveMetaRef(ref, pack, parentDoc, item), node: item as Node});
                             } else {
-                                mergeSources.push({source: resolveValue(item as Node, pack, parentDoc), node: item});
+                                mergeSources.push({source: resolveValue(item as Node, pack, parentDoc), node: item as Node});
                             }
                         }
                     } else {
