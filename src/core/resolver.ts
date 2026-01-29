@@ -11,15 +11,15 @@ function isFileLikeMetaRef(raw: string): boolean {
     // raw is like "$biomes/colors.yml:DRAGON_PIT"
     const s = raw.startsWith("$") ? raw.slice(1) : raw;
 
-    // allow ${...} handled elsewhere
-    // The key: avoid treating "$ID" as a file.
-    return (
-        s.includes(".yml") ||
-        s.includes(".yaml") ||
-        s.includes("/") ||
-        s.includes("\\") ||
-        s.includes(":")
-    );
+    if (s.includes(".yml") || s.includes(".yaml") || s.includes("/") || s.includes("\\")) return true;
+
+    // If it has a colon, only accept if the LHS looks path-ish
+    const i = s.indexOf(":");
+    if (i !== -1) {
+        const lhs = s.slice(0, i);
+        return lhs.includes("/") || lhs.includes("\\") || lhs.includes(".yml") || lhs.includes(".yaml");
+    }
+    return false;
 }
 
 // Helper function to detect file-like paths
@@ -322,9 +322,9 @@ export function resolveValue(
                         if (isScalar(mergeValue)) {
                             const valueVal = String(mergeValue.value);
                             // Only treat as meta ref if it has meta-ref characteristics
-                            if (valueVal.startsWith('$') || valueVal.includes('/') || valueVal.includes(':') || valueVal.includes('.yml') || valueVal.includes('.yaml')) {
-                                const ref = valueVal.startsWith('$') ? valueVal : '$' + valueVal;
-                                mergeSources.push({source: resolveMetaRef(ref, pack, parentDoc, mergeValue), node: mergeValue});
+                            const refCandidate = valueVal.startsWith('$') ? valueVal : '$' + valueVal;
+                            if (isFileLikeMetaRef(refCandidate)) {
+                                mergeSources.push({source: resolveMetaRef(refCandidate, pack, parentDoc, mergeValue), node: mergeValue});
                             } else {
                                 // Plain scalar - this is an error for map merge
                                 const mergeRange = mergeValue.range ? {
@@ -471,6 +471,10 @@ export function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, n
     // Hard guard: don't treat non-file-like refs as meta refs at all
     if (!isFileLikeMetaRef(ref)) {
         const range = node?.range ? { start: node.range[0], end: node.range[1] } : undefined;
+        const fullRange = range ? {
+            start: { ...parentDoc.lineCounter.linePos(range.start), offset: range.start },
+            end: { ...parentDoc.lineCounter.linePos(range.end), offset: range.end }
+        } : undefined;
         const origin: Origin = {
             via: 'direct',
             file: parentDoc.filePath,
@@ -479,7 +483,7 @@ export function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, n
                 scalarType: 'string',
                 raw: ref
             },
-            fullRange: range
+            fullRange
         };
         return createPScalar(ref, origin);
     }
