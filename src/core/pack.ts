@@ -34,7 +34,7 @@ export class Pack {
         }
 
         const content = readFileSync(packYmlPath, 'utf8');
-        const { parsed, diagnostics: yamlDiagnostics } = parseYaml(content, 'pack.yml');
+        const { parsed, diagnostics: yamlDiagnostics } = parseYaml(content, packYmlPath);
         this.diagnostics.push(...yamlDiagnostics);
 
         if (parsed && parsed.doc.contents) {
@@ -122,10 +122,44 @@ export class Pack {
         }
     }
 
+    private reportDiagnostic(
+        code: string,
+        message: string,
+        severity: 'error' | 'warning',
+        context: any,
+        fallbackDoc: ParsedYaml,
+        fallbackRange?: any,
+        fieldName?: string
+    ) {
+        let origin = context?.__terra_origin as ParsedYaml | undefined;
+        let range = context?.__terra_range || fallbackRange;
+
+        if (fieldName && context?.__terra_metadata instanceof Map) {
+            const meta = context.__terra_metadata.get(fieldName);
+            if (meta) {
+                origin = meta.origin;
+                range = meta.range;
+            }
+        }
+
+        const finalDoc = origin || fallbackDoc;
+
+        this.diagnostics.push({
+            code,
+            message,
+            severity,
+            file: finalDoc.filePath,
+            range: range ? {
+                start: { ...finalDoc.lineCounter.linePos(range[0]), offset: range[0] },
+                end: { ...finalDoc.lineCounter.linePos(range[1]), offset: range[1] }
+            } : undefined
+        });
+    }
+
     private loadFragment(fullPath: string, relativePath: string) {
         try {
             const content = readFileSync(fullPath, 'utf8');
-            const { parsed, diagnostics: yamlDiagnostics } = parseYaml(content, relativePath);
+            const { parsed, diagnostics: yamlDiagnostics } = parseYaml(content, fullPath);
             this.diagnostics.push(...yamlDiagnostics);
 
             if (parsed) {
@@ -148,12 +182,12 @@ export class Pack {
                 const effective = this.registry.getEffectiveObject('BIOME', biome.id, this);
 
                 if (effective.palette) {
-                    this.validatePalette(effective.palette, biome.parsedYaml.filePath);
+                    this.validatePalette(effective.palette, biome.parsedYaml);
                 }
                 if (effective.slant) {
                     for (const item of effective.slant) {
                         if (item.palette) {
-                            this.validatePalette(item.palette, biome.parsedYaml.filePath);
+                            this.validatePalette(item.palette, biome.parsedYaml);
                         }
                     }
                 }
@@ -212,42 +246,50 @@ export class Pack {
         }
     }
 
-    private validatePalette(palette: any, filePath: string) {
-        // We need the parsed doc to get ranges
-        const doc = this.registry.getAllDocs().find(d => d.filePath === filePath);
-
+    private validatePalette(palette: any, biomeDoc: ParsedYaml) {
         if (!Array.isArray(palette)) {
-            this.diagnostics.push({
-                code: 'INVALID_PALETTE_STRUCTURE',
-                message: 'Palette must be a sequence of layers.',
-                severity: 'error',
-                file: filePath
-            });
+            this.reportDiagnostic(
+                'INVALID_PALETTE_STRUCTURE',
+                'Palette must be a sequence of layers.',
+                'error',
+                palette,
+                biomeDoc
+            );
             return;
         }
 
         for (const layer of palette) {
-            if (typeof layer === 'object' && layer !== null && !Array.isArray(layer)) {
+            let id: string | undefined;
+            let context: any = layer;
+
+            if (typeof layer === 'string') {
+                id = layer;
+            } else if (typeof layer === 'object' && layer !== null && !Array.isArray(layer)) {
                 const keys = Object.keys(layer);
                 if (keys.length > 1) {
-                    this.diagnostics.push({
-                        code: 'INVALID_PALETTE_LAYER',
-                        message: `Palette layer has multiple keys: [${keys.join(', ')}]. Each layer should be a single block/palette reference. (Likely caused by incorrect <<: merge in a list)`,
-                        severity: 'error',
-                        file: filePath
-                    });
+                    this.reportDiagnostic(
+                        'INVALID_PALETTE_LAYER',
+                        `Palette layer has multiple keys: [${keys.join(', ')}]. Each layer should be a single block/palette reference. (Likely caused by incorrect <<: merge in a list)`,
+                        'error',
+                        layer,
+                        biomeDoc
+                    );
                 } else if (keys.length === 1) {
-                    const id = keys[0];
-                    if (!id.includes(':')) {
-                        if (!this.registry.getObject('PALETTE', id)) {
-                            this.diagnostics.push({
-                                code: 'PALETTE_MISSING',
-                                message: `Referenced palette "${id}" not found. If this is a block ID, use "minecraft:${id}" or "BLOCK:minecraft:${id}".`,
-                                severity: 'warning',
-                                file: filePath
-                            });
-                        }
-                    }
+                    id = keys[0];
+                }
+            }
+
+            if (id && !id.includes(':')) {
+                if (!this.registry.getObject('PALETTE', id)) {
+                    this.reportDiagnostic(
+                        'PALETTE_MISSING',
+                        `Referenced palette "${id}" not found. If this is a block ID, use "minecraft:${id}" or "BLOCK:minecraft:${id}".`,
+                        'warning',
+                        context,
+                        biomeDoc,
+                        undefined,
+                        id === context ? undefined : id
+                    );
                 }
             }
         }
@@ -268,16 +310,14 @@ export class Pack {
             if (!this.registry.getObject('FEATURE', id)) {
                 // If it looks like a file path (has extension or /), call it a structure missing
                 const isLikelyFile = id.includes('.') || id.includes('/') || id.includes('\\');
-                this.diagnostics.push({
-                    code: isLikelyFile ? 'STRUCTURE_REF_MISSING' : 'FEATURE_REF_MISSING',
-                    message: `Referenced ${isLikelyFile ? 'structure' : 'feature/structure'} "${id}" not found in registry or structures/ directory.`,
-                    severity: 'error',
-                    file: doc.filePath,
-                    range: range ? {
-                        start: { ...doc.lineCounter.linePos(range[0]), offset: range[0] },
-                        end: { ...doc.lineCounter.linePos(range[1]), offset: range[1] }
-                    } : undefined
-                });
+                this.reportDiagnostic(
+                    isLikelyFile ? 'STRUCTURE_REF_MISSING' : 'FEATURE_REF_MISSING',
+                    `Referenced ${isLikelyFile ? 'structure' : 'feature/structure'} "${id}" not found in registry or structures/ directory.`,
+                    'error',
+                    undefined, // Scalars have no metadata here
+                    doc,
+                    range
+                );
             }
         }
     }

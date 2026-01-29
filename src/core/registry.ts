@@ -136,7 +136,8 @@ export class Registry {
             const currentResolved = resolveValue(obj.node, pack, obj.parsedYaml);
 
             // Priority Shadowing: child values overwrite parents entirely (shallow merge)
-            return Object.assign(base, currentResolved);
+            const result = Object.assign(base, currentResolved.value);
+            return result;
         } finally {
             seen.delete(key);
         }
