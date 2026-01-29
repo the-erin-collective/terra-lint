@@ -1,7 +1,8 @@
-import { isMap, isScalar, isSeq, Node, Scalar } from 'yaml';
+import { isMap, isScalar, isSeq, Node, Scalar, isAlias } from 'yaml';
 import path from 'path';
+import { existsSync, readFileSync } from 'fs';
 import type { Pack } from '../core/pack.js';
-import { ParsedYaml } from '../parser/yaml.js';
+import { ParsedYaml, parseYaml } from '../parser/yaml.js';
 import { validateBlockState, validateExpression } from './validation-utils.js';
 import { PValue, Origin, createPScalar, createPSeq, createPMap, isPMap, isPSeq, toJS } from './pvalue/types.js';
 
@@ -11,6 +12,11 @@ export function resolveValue(
     parentDoc: ParsedYaml,
     fieldPath: string[] = []
 ): PValue {
+    // Handle YAML aliases by resolving them first
+    if (node && isAlias(node)) {
+        return resolveValue(node.resolve(parentDoc.doc), pack, parentDoc, fieldPath);
+    }
+    
     // Default origin for missing nodes is just the file (or parent node's location?)
     // If node is null, we return a null scalar with file origin
     const defaultOrigin: Origin = { file: parentDoc.filePath };
@@ -228,9 +234,14 @@ export function resolveValue(
                 const keyStr = String(key.value);
 
                 if (keyStr === '<<') {
-                    // Collect merge sources for later processing
-                    if (isSeq(value)) {
-                        for (const item of value.items) {
+                    // Handle merge sources - check if value is an alias
+                    let mergeValue = value;
+                    if (isAlias(value)) {
+                        mergeValue = value.resolve(parentDoc.doc);
+                    }
+                    
+                    if (isSeq(mergeValue)) {
+                        for (const item of mergeValue.items) {
                             // If item is scalar, treat as meta ref (with or without $)
                             if (isScalar(item)) {
                                 const itemVal = String(item.value);
@@ -242,12 +253,12 @@ export function resolveValue(
                         }
                     } else {
                         // Single value
-                        if (isScalar(value)) {
-                            const valueVal = String(value.value);
+                        if (isScalar(mergeValue)) {
+                            const valueVal = String(mergeValue.value);
                             const ref = valueVal.startsWith('$') ? valueVal : '$' + valueVal;
-                            mergeSources.push({source: resolveMetaRef(ref, pack, parentDoc, value), node: value});
+                            mergeSources.push({source: resolveMetaRef(ref, pack, parentDoc, mergeValue), node: mergeValue});
                         } else {
-                            mergeSources.push({source: resolveValue(value as Node, pack, parentDoc), node: value});
+                            mergeSources.push({source: resolveValue(mergeValue as Node, pack, parentDoc), node: mergeValue});
                         }
                     }
                 } else {
@@ -325,14 +336,8 @@ export function resolveValue(
                 continue;
             }
 
-            // List-Merge Compatibility: - <<: ref (Map inside List) -- Is this standard Terra?
-            // "List-Merge Compatibility: - <<: ref" lines 262-306 in original resolver.
-            // If item is map with single key `<<`.
-            // List-Merge Compatibility: - <<: ref (Map inside List)
-            // Restricted to palette and features to avoid masking errors.
-            const allowListMerge = pathStr.includes('.palette') || pathStr.includes('.features');
-
-            if (allowListMerge && isMap(item)) {
+            // Terra List-Merge: - <<: $ref (Map inside List)
+            if (isMap(item)) {
                 const mapItems = (item as any).items;
                 if (mapItems.length === 1 && isScalar(mapItems[0].key) && mapItems[0].key.value === '<<') {
                     // Same logic as splice
@@ -343,21 +348,22 @@ export function resolveValue(
                         const ref = v.startsWith('$') ? v : '$' + v;
                         resolved = resolveMetaRef(ref, pack, parentDoc, valNode);
                     } else {
-                        resolved = resolveValue(valNode, pack, parentDoc);
+                        resolved = resolveValue(valNode as Node, pack, parentDoc);
                     }
 
                     if (resolved.kind === 'seq') {
                         items.push(...resolved.items);
                     } else {
-                        // Strict: must be a sequence for list-merge compatibility
+                        // This is the Terra-specific case where we want to merge a sequence into a list
+                        // If the resolved value is a map, that's an error for list merge
                         const listMergeRange = item.range ? {
                             start: { ...parentDoc.lineCounter.linePos(item.range[0]), offset: item.range[0] },
                             end: { ...parentDoc.lineCounter.linePos(item.range[1]), offset: item.range[1] }
                         } : undefined;
                         
                         pack.diagnostics.push({
-                            code: 'META_SPLICE_NOT_A_LIST',
-                            message: `List-merge target is not a list (got ${resolved.kind})`,
+                            code: 'META_MERGE_NOT_A_MAP',
+                            message: `Cannot merge a ${resolved.kind} into a list.`,
                             severity: 'error',
                             file: parentDoc.filePath,
                             range: listMergeRange
@@ -442,6 +448,35 @@ export function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, n
     }
 
     if (results.length === 0) {
+        // Filesystem fallback: try to find the file directly on disk
+        const fallbackDoc = tryFilesystemFallback(filePath, pack, parentDoc);
+        if (fallbackDoc) {
+            let current: Node | null | undefined = fallbackDoc.doc.contents as any;
+            for (const part of pathInFile) {
+                let next: Node | null | undefined;
+                if (isMap(current)) next = (current as any).get(part, true) as any;
+                else if (isSeq(current) && /^\d+$/.test(part)) next = (current as any).items[parseInt(part, 10)];
+
+                if (next === undefined || next === null) {
+                    pack.diagnostics.push({
+                        code: 'META_REF_PATH_MISSING',
+                        message: `Path "${pathInFile.join('.')}" not found in meta file.`,
+                        severity: 'error',
+                        file: parentDoc.filePath,
+                        range: origin.fullRange
+                    });
+                    return createPScalar(ref, origin);
+                }
+                current = next;
+            }
+
+            const resolved = resolveValue(current, pack, fallbackDoc);
+            const metaSiteKind = node ? 
+                (isScalar(node) ? 'scalar' : isMap(node) ? 'map' : isSeq(node) ? 'seq' : 'scalar') : 
+                'scalar';
+            return markAsMetaDerived(resolved, parentDoc.filePath, range, String(node?.value || ref), metaSiteKind);
+        }
+
         pack.diagnostics.push({
             code: 'META_REF_FILE_MISSING',
             message: `Meta file "${filePath}" not found.`,
@@ -511,6 +546,62 @@ function markAsMetaDerived(pvalue: PValue, metaSiteFile: string, metaSiteRange?:
     if (pvalue.kind === 'seq') return { ...pvalue, origin: metaOrigin };
     if (pvalue.kind === 'map') return { ...pvalue, origin: metaOrigin };
     return pvalue;
+}
+
+// Helper function for filesystem fallback
+function tryFilesystemFallback(filePath: string, pack: Pack, parentDoc: ParsedYaml): ParsedYaml | null {
+    const roots = [pack.rootPath, ...pack.includePaths];
+    
+    for (const root of roots) {
+        // Try exact match first
+        let fullPath = path.join(root, filePath);
+        if (existsSync(fullPath) && (fullPath.endsWith('.yml') || fullPath.endsWith('.yaml'))) {
+            try {
+                const content = readFileSync(fullPath, 'utf8');
+                const { parsed } = parseYaml(content, fullPath, 'root');
+                if (parsed) {
+                    pack.registry.addParsedDoc(parsed, pack);
+                    return parsed;
+                }
+            } catch (e) {
+                // Continue to next attempt
+            }
+        }
+        
+        // Try with .yml extension
+        if (!filePath.endsWith('.yml') && !filePath.endsWith('.yaml')) {
+            fullPath = path.join(root, filePath + '.yml');
+            if (existsSync(fullPath)) {
+                try {
+                    const content = readFileSync(fullPath, 'utf8');
+                    const { parsed } = parseYaml(content, fullPath, 'root');
+                    if (parsed) {
+                        pack.registry.addParsedDoc(parsed, pack);
+                        return parsed;
+                    }
+                } catch (e) {
+                    // Continue to next attempt
+                }
+            }
+            
+            // Try with .yaml extension
+            fullPath = path.join(root, filePath + '.yaml');
+            if (existsSync(fullPath)) {
+                try {
+                    const content = readFileSync(fullPath, 'utf8');
+                    const { parsed } = parseYaml(content, fullPath, 'root');
+                    if (parsed) {
+                        pack.registry.addParsedDoc(parsed, pack);
+                        return parsed;
+                    }
+                } catch (e) {
+                    // Continue to next attempt
+                }
+            }
+        }
+    }
+    
+    return null;
 }
 
 // Deprecated or integrated helpers

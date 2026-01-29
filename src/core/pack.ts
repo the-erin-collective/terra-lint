@@ -48,14 +48,19 @@ export class Pack {
     }
 
     public isExpressionField(pathStr: string, fieldName: string): boolean {
-        // Check against configured rules
-        // Convention: 
-        // - Starts with '.' -> Check if pathStr ends with or includes this (for backward compat with original logic)
-        // - No '.' -> Check if fieldName equals this
-        // Original logic:
-        // pathStr.endsWith('.palette') || pathStr.includes('.slant') || pathStr.includes('.features.')
-        // ['BEDROCK',...].includes(lastField)
-
+        // Exclude pack.yml metadata fields that should never be expressions
+        const excludedPaths = [
+            'id', 'version', 'author', 'generator', 'vanilla', 'vanilla-generation',
+            'addons', 'preset-single-biome', 'preset-single-debug-biome'
+        ];
+        
+        // If the path starts with 'addons.', it's definitely not an expression field
+        if (pathStr.startsWith('addons.') || excludedPaths.includes(fieldName)) {
+            return false;
+        }
+        
+        // Check against configured rules (whitelist approach)
+        // Only allow expressions in known safe contexts
         return this.rules.expressionFields.some(rule => {
             if (rule.startsWith('.')) {
                 return pathStr.endsWith(rule) || pathStr.includes(rule);
@@ -156,18 +161,27 @@ export class Pack {
             this.registry.addParsedDoc(parsed, this);
         }
 
-        // Load fragments from pack root
-        const ymlFiles = await fg('**/*.yml', { cwd: this.rootPath, ignore: ['pack.yml', ...this.ignorePatterns] });
-        for (const f of ymlFiles) {
+        // Load all YAML files from pack root recursively
+        const defaultIgnorePatterns = ['**/node_modules/**', '**/.git/**', '**/build/**', '**/dist/**'];
+        const allIgnorePatterns = [...defaultIgnorePatterns, ...this.ignorePatterns];
+        
+        const ymlFiles = await fg('**/*.yml', { cwd: this.rootPath, ignore: allIgnorePatterns });
+        const yamlFiles = await fg('**/*.yaml', { cwd: this.rootPath, ignore: allIgnorePatterns });
+        const allYamlFiles = [...new Set([...ymlFiles, ...yamlFiles])].filter(f => f !== 'pack.yml');
+        
+        for (const f of allYamlFiles) {
             const fullPath = path.join(this.rootPath, f);
             this.loadFragment(fullPath, f, 'root');
         }
 
-        // Load fragments from include paths
+        // Load all YAML files from include paths recursively
         for (const includePath of this.includePaths) {
             if (existsSync(includePath)) {
-                const includeFiles = await fg('**/*.yml', { cwd: includePath, ignore: this.ignorePatterns });
-                for (const f of includeFiles) {
+                const includeYmlFiles = await fg('**/*.yml', { cwd: includePath, ignore: allIgnorePatterns });
+                const includeYamlFiles = await fg('**/*.yaml', { cwd: includePath, ignore: allIgnorePatterns });
+                const allIncludeFiles = [...new Set([...includeYmlFiles, ...includeYamlFiles])];
+                
+                for (const f of allIncludeFiles) {
                     const fullPath = path.join(includePath, f);
                     this.loadFragment(fullPath, f, 'include');
                 }

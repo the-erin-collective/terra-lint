@@ -35,7 +35,6 @@ function scalarSubtypeMatches(p: PValue, expected: "string"|"number"|"boolean") 
 
 export const PACK_SCHEMA: Record<string, SchemaField> = {
     id: { type: 'string', required: true },
-    name: { type: 'string', required: true },
     version: { type: 'string', required: true },
     stages: {
         type: 'list',
