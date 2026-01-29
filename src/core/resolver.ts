@@ -194,9 +194,10 @@ export function resolveValue(
             }
         }
 
-        // Block state validation
+        // Block state validation - only trigger on actual block state syntax
         const looksLikeBlockId = /^[a-z_]+:[a-z_]+/.test(val) || val.toUpperCase().startsWith('BLOCK:');
-        if ((isBlockField || looksLikeBlockId) && val.includes('[')) {
+        const hasBlockStateBrackets = /(^|BLOCK:)[a-z0-9_]+:[a-z0-9_/.-]+\[[^\]]*\]/i.test(val);
+        if ((isBlockField || looksLikeBlockId) && hasBlockStateBrackets) {
             const blockRes = validateBlockState(val);
             if (!blockRes.isValid) {
                 const isInPalette = pathStr.includes('.palette');
