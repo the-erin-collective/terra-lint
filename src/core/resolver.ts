@@ -6,6 +6,27 @@ import { ParsedYaml, parseYaml } from '../parser/yaml.js';
 import { validateBlockState, validateExpression } from './validation-utils.js';
 import { PValue, Origin, createPScalar, createPSeq, createPMap, isPMap, isPSeq, toJS } from './pvalue/types.js';
 
+// Helper function to detect file-like meta references
+function isFileLikeMetaRef(raw: string): boolean {
+    // raw is like "$biomes/colors.yml:DRAGON_PIT"
+    const s = raw.startsWith("$") ? raw.slice(1) : raw;
+
+    // allow ${...} handled elsewhere
+    // The key: avoid treating "$ID" as a file.
+    return (
+        s.includes(".yml") ||
+        s.includes(".yaml") ||
+        s.includes("/") ||
+        s.includes("\\") ||
+        s.includes(":")
+    );
+}
+
+// Helper function to detect file-like paths
+function isFileLikePath(s: string): boolean {
+    return s.includes(".yml") || s.includes(".yaml") || s.includes("/") || s.includes("\\");
+}
+
 export function resolveValue(
     node: Node | null | undefined,
     pack: Pack,
@@ -137,7 +158,7 @@ export function resolveValue(
         }
 
         // Terra MetaValue: $ref (entire scalar)
-        if (val.startsWith('$')) {
+        if (val.startsWith('$') && isFileLikeMetaRef(val)) {
             const resolved = resolveMetaRef(val, pack, parentDoc, node);
             
             // Create metaSite information - MetaValue is always from a scalar
@@ -474,33 +495,49 @@ export function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, n
     }
 
     if (results.length === 0) {
-        // Filesystem fallback: try to find the file directly on disk
-        const fallbackDoc = tryFilesystemFallback(filePath, pack, parentDoc);
-        if (fallbackDoc) {
-            let current: Node | null | undefined = fallbackDoc.doc.contents as any;
-            for (const part of pathInFile) {
-                let next: Node | null | undefined;
-                if (isMap(current)) next = (current as any).get(part, true) as any;
-                else if (isSeq(current) && /^\d+$/.test(part)) next = (current as any).items[parseInt(part, 10)];
-
-                if (next === undefined || next === null) {
-                    pack.diagnostics.push({
-                        code: 'META_REF_PATH_MISSING',
-                        message: `Path "${pathInFile.join('.')}" not found in meta file.`,
-                        severity: 'error',
-                        file: parentDoc.filePath,
-                        range: origin.fullRange
-                    });
-                    return createPScalar(ref, origin);
-                }
-                current = next;
+        // Only try filesystem fallback for file-like paths
+        if (isFileLikePath(filePath)) {
+            const fsRes = tryFilesystemFallback(filePath, pack, parentDoc);
+            
+            if (fsRes.kind === "ambiguous") {
+                pack.diagnostics.push({
+                    code: 'META_REF_AMBIGUOUS',
+                    message: `Ambiguous meta-reference "${filePath}". Multiple files match:\n` +
+                             fsRes.candidates.slice(0, 5).join("\n") + (fsRes.candidates.length > 5 ? "\n..." : ""),
+                    severity: 'error',
+                    file: parentDoc.filePath,
+                    range: origin.fullRange
+                });
+                return createPScalar(ref, origin);
             }
+            
+            if (fsRes.kind === "found") {
+                const fallbackDoc = fsRes.doc;
+                let current: Node | null | undefined = fallbackDoc.doc.contents as any;
+                for (const part of pathInFile) {
+                    let next: Node | null | undefined;
+                    if (isMap(current)) next = (current as any).get(part, true) as any;
+                    else if (isSeq(current) && /^\d+$/.test(part)) next = (current as any).items[parseInt(part, 10)];
 
-            const resolved = resolveValue(current, pack, fallbackDoc);
-            const metaSiteKind = node ? 
-                (isScalar(node) ? 'scalar' : isMap(node) ? 'map' : isSeq(node) ? 'seq' : 'scalar') : 
-                'scalar';
-            return markAsMetaDerived(resolved, parentDoc.filePath, range, String(node?.value || ref), metaSiteKind);
+                    if (next === undefined || next === null) {
+                        pack.diagnostics.push({
+                            code: 'META_REF_PATH_MISSING',
+                            message: `Path "${pathInFile.join('.')}" not found in meta file.`,
+                            severity: 'error',
+                            file: parentDoc.filePath,
+                            range: origin.fullRange
+                        });
+                        return createPScalar(ref, origin);
+                    }
+                    current = next;
+                }
+
+                const resolved = resolveValue(current, pack, fallbackDoc);
+                const metaSiteKind = node ? 
+                    (isScalar(node) ? 'scalar' : isMap(node) ? 'map' : isSeq(node) ? 'seq' : 'scalar') : 
+                    'scalar';
+                return markAsMetaDerived(resolved, parentDoc.filePath, range, String(node?.value || ref), metaSiteKind);
+            }
         }
 
         pack.diagnostics.push({
@@ -575,7 +612,12 @@ function markAsMetaDerived(pvalue: PValue, metaSiteFile: string, metaSiteRange?:
 }
 
 // Helper function for filesystem fallback
-function tryFilesystemFallback(filePath: string, pack: Pack, parentDoc: ParsedYaml): ParsedYaml | null {
+type FsFallbackResult =
+  | { kind: "found"; doc: ParsedYaml }
+  | { kind: "ambiguous"; candidates: string[] }
+  | { kind: "missing" };
+
+function tryFilesystemFallback(filePath: string, pack: Pack, parentDoc: ParsedYaml): FsFallbackResult {
     const roots = [pack.rootPath, ...pack.includePaths];
     const foundFiles: Array<{path: string, root: string}> = [];
     
@@ -604,12 +646,14 @@ function tryFilesystemFallback(filePath: string, pack: Pack, parentDoc: ParsedYa
     
     // Check for ambiguity
     if (foundFiles.length > 1) {
-        // Report ambiguity but don't use any of them
-        return null; // Let the main function handle the ambiguity error
+        return { 
+            kind: "ambiguous", 
+            candidates: foundFiles.map(f => f.path) 
+        };
     }
     
     if (foundFiles.length === 0) {
-        return null;
+        return { kind: "missing" };
     }
     
     // Load the single found file
@@ -619,13 +663,13 @@ function tryFilesystemFallback(filePath: string, pack: Pack, parentDoc: ParsedYa
         const { parsed } = parseYaml(content, fullPath, 'root');
         if (parsed) {
             pack.registry.addParsedDoc(parsed, pack);
-            return parsed;
+            return { kind: "found", doc: parsed };
         }
     } catch (e) {
-        // Continue to return null
+        // Continue to return missing
     }
     
-    return null;
+    return { kind: "missing" };
 }
 
 // Deprecated or integrated helpers
