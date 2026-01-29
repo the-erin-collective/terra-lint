@@ -93,7 +93,26 @@ export function resolveValue(
             let match;
             while ((match = regex.exec(val)) !== null) {
                 const ref = match[1];
-                const resolved = resolveMetaRef('$' + ref, pack, parentDoc, node);
+                const rawRef = '$' + ref;
+                
+                // Guard: only resolve file-like references
+                if (!isFileLikeMetaRef(rawRef)) {
+                    // If it's not file-like, treat it as literal text
+                    out += val.slice(last, match.index);
+                    out += '${' + ref + '}';
+                    last = match.index + match[0].length;
+
+                    pack.diagnostics.push({
+                        code: 'META_STRING_NON_FILE_REF',
+                        message: `MetaString reference "${ref}" doesn't look like a file/path reference.`,
+                        severity: 'warning',
+                        file: parentDoc.filePath,
+                        range: origin.fullRange
+                    });
+                    continue;
+                }
+                
+                const resolved = resolveMetaRef(rawRef, pack, parentDoc, node);
 
                 // resolved is PValue. Expect scalar for interpolation.
                 // If it's not a scalar, stringify it?
@@ -275,8 +294,25 @@ export function resolveValue(
                             // If item is scalar, treat as meta ref (with or without $)
                             if (isScalar(item)) {
                                 const itemVal = String(item.value);
-                                const ref = itemVal.startsWith('$') ? itemVal : '$' + itemVal;
-                                mergeSources.push({source: resolveMetaRef(ref, pack, parentDoc, item), node: item as Node});
+                                const refCandidate = itemVal.startsWith('$') ? itemVal : '$' + itemVal;
+                                
+                                if (isFileLikeMetaRef(refCandidate)) {
+                                    mergeSources.push({source: resolveMetaRef(refCandidate, pack, parentDoc, item), node: item as Node});
+                                } else {
+                                    // Not file-like -> merge is invalid
+                                    const mergeRange = item.range ? {
+                                        start: { ...parentDoc.lineCounter.linePos(item.range[0]), offset: item.range[0] },
+                                        end: { ...parentDoc.lineCounter.linePos(item.range[1]), offset: item.range[1] }
+                                    } : undefined;
+
+                                    pack.diagnostics.push({
+                                        code: 'META_MERGE_NOT_A_MAP',
+                                        message: `Cannot merge "${itemVal}" into a map. Expected a map reference like "path.yml:key".`,
+                                        severity: 'error',
+                                        file: parentDoc.filePath,
+                                        range: mergeRange
+                                    });
+                                }
                             } else {
                                 mergeSources.push({source: resolveValue(item as Node, pack, parentDoc), node: item as Node});
                             }
@@ -431,6 +467,22 @@ export function resolveValue(
 export function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, node?: any): PValue {
     // Note: This logic duplicates path finding. Ideally extract 'findDoc(path)' logic.
     // For now, I'll basically inline the logic but return PValue.
+
+    // Hard guard: don't treat non-file-like refs as meta refs at all
+    if (!isFileLikeMetaRef(ref)) {
+        const range = node?.range ? { start: node.range[0], end: node.range[1] } : undefined;
+        const origin: Origin = {
+            via: 'direct',
+            file: parentDoc.filePath,
+            authoring: {
+                kind: 'scalar',
+                scalarType: 'string',
+                raw: ref
+            },
+            fullRange: range
+        };
+        return createPScalar(ref, origin);
+    }
 
     let pathStr = ref.startsWith('$') ? ref.substring(1) : ref;
     if (pathStr.startsWith('{') && pathStr.endsWith('}')) pathStr = pathStr.substring(1, pathStr.length - 1);
@@ -648,7 +700,13 @@ function tryFilesystemFallback(filePath: string, pack: Pack, parentDoc: ParsedYa
     if (foundFiles.length > 1) {
         return { 
             kind: "ambiguous", 
-            candidates: foundFiles.map(f => f.path) 
+            candidates: foundFiles.map(f => {
+                // Try to make path relative to the most appropriate root
+                const relativeToPack = path.relative(pack.rootPath, f.path);
+                const relativeToInclude = f.root !== pack.rootPath ? 
+                    ` (from include: ${path.relative(f.root, f.path)})` : '';
+                return relativeToPack + relativeToInclude;
+            })
         };
     }
     
