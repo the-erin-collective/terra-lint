@@ -122,7 +122,16 @@ export function resolveValue(
             };
 
             if (/^-?\d+(\.\d+)?$/.test(val)) {
-                return createPScalar(Number(val), metaStringOrigin);
+                const numericVal = Number(val);
+                const numericOrigin: Origin = {
+                    ...metaStringOrigin,
+                    authoring: {
+                        ...metaStringOrigin.authoring!,
+                        scalarType: 'number',
+                        raw: val
+                    }
+                };
+                return createPScalar(numericVal, numericOrigin);
             }
             return createPScalar(val, metaStringOrigin);
         }
