@@ -481,7 +481,31 @@ export function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, n
         current = next;
     }
 
-    return resolveValue(current, pack, doc);
+    const resolved = resolveValue(current, pack, doc);
+    return markAsMetaDerived(resolved, parentDoc.filePath, range, String(node?.value || ref));
+}
+
+// Helper function to mark PValue as meta-derived
+function markAsMetaDerived(pvalue: PValue, metaSiteFile: string, metaSiteRange?: { start: number; end: number }, metaSiteRaw?: string): PValue {
+    const metaSite = {
+        file: metaSiteFile,
+        range: metaSiteRange,
+        kind: pvalue.origin.authoring?.kind || 'scalar',
+        raw: metaSiteRaw
+    };
+
+    const metaOrigin: Origin = {
+        ...pvalue.origin,
+        via: 'meta',
+        metaSite
+        // Keep pvalue.origin.authoring intact - it belongs to the referenced file's node
+    };
+
+    // Shallow clone to update origin
+    if (pvalue.kind === 'scalar') return { ...pvalue, origin: metaOrigin };
+    if (pvalue.kind === 'seq') return { ...pvalue, origin: metaOrigin };
+    if (pvalue.kind === 'map') return { ...pvalue, origin: metaOrigin };
+    return pvalue;
 }
 
 // Deprecated or integrated helpers

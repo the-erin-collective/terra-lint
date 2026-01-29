@@ -11,6 +11,28 @@ export interface SchemaField {
     properties?: Record<string, SchemaField>; // For maps
 }
 
+// Helper functions for proper scalar field validation
+function isScalarFieldType(t: SchemaField["type"]) {
+    return t === "string" || t === "number" || t === "boolean";
+}
+
+function expectedKindForField(t: SchemaField["type"]): "scalar" | "map" | "seq" | "any" {
+    if (t === "any") return "any";
+    if (t === "map") return "map";
+    if (t === "list") return "seq";
+    if (t === "scalar") return "scalar";
+    if (isScalarFieldType(t)) return "scalar";
+    return "any";
+}
+
+function scalarSubtypeMatches(p: PValue, expected: "string"|"number"|"boolean") {
+    if (!isPScalar(p)) return false;
+    const st = p.origin.authoring?.scalarType;
+    // fallback if authoring scalarType missing
+    if (!st || st === "unknown") return true;
+    return st === expected;
+}
+
 export const PACK_SCHEMA: Record<string, SchemaField> = {
     id: { type: 'string', required: true },
     name: { type: 'string', required: true },
@@ -134,15 +156,18 @@ export function validatePValueSchema(pvalue: PValue, schema: Record<string, Sche
         const validationKind = getValidationKind(val);
         const isMeta = isMetaDerived(val);
         
-        let typeMatch = false;
-        if (field.type === 'any') typeMatch = true;
-        else if (field.type === 'scalar') {
-            // For scalar fields, accept any scalar kind
-            typeMatch = validationKind === 'scalar';
-        } else {
-            // For specific container types, match the kind
-            const expectedKind = field.type === 'map' ? 'map' : field.type === 'list' ? 'seq' : field.type;
-            typeMatch = validationKind === expectedKind;
+        const expectedKind = expectedKindForField(field.type);
+
+        let typeMatch =
+            expectedKind === "any" ? true :
+            validationKind === expectedKind;
+
+        if (typeMatch && isScalarFieldType(field.type)) {
+            // If meta-derived, only require "scalar" container
+            if (!isMeta) {
+                // direct value: enforce subtype
+                typeMatch = scalarSubtypeMatches(val, field.type);
+            }
         }
 
         if (!typeMatch) {
@@ -192,15 +217,18 @@ function validatePValueSchemaField(pvalue: PValue, field: SchemaField, pack: Pac
     const validationKind = getValidationKind(pvalue);
     const isMeta = isMetaDerived(pvalue);
     
-    let typeMatch = false;
-    if (field.type === 'any') typeMatch = true;
-    else if (field.type === 'scalar') {
-        // For scalar fields, accept any scalar kind
-        typeMatch = validationKind === 'scalar';
-    } else {
-        // For specific container types, match the kind
-        const expectedKind = field.type === 'map' ? 'map' : field.type === 'list' ? 'seq' : field.type;
-        typeMatch = validationKind === expectedKind;
+    const expectedKind = expectedKindForField(field.type);
+
+    let typeMatch =
+        expectedKind === "any" ? true :
+        validationKind === expectedKind;
+
+    if (typeMatch && isScalarFieldType(field.type)) {
+        // If meta-derived, only require "scalar" container
+        if (!isMeta) {
+            // direct value: enforce subtype
+            typeMatch = scalarSubtypeMatches(pvalue, field.type);
+        }
     }
 
     if (!typeMatch) {
