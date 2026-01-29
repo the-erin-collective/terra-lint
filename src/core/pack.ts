@@ -13,10 +13,12 @@ export class Pack {
     public stageIds: Set<string> = new Set();
     public structureFiles: Set<string> = new Set();
     public structureExtensions: string[];
+    public includePaths: string[];
 
-    constructor(rootPath: string, opts?: { structureExtensions?: string[] }) {
+    constructor(rootPath: string, opts?: { structureExtensions?: string[], includePaths?: string[] }) {
         this.rootPath = path.resolve(rootPath);
         this.structureExtensions = opts?.structureExtensions?.length ? opts.structureExtensions : ['nbt'];
+        this.includePaths = (opts?.includePaths || []).map(p => path.resolve(p));
     }
 
     async load() {
@@ -87,20 +89,25 @@ export class Pack {
             }
         }
 
-        // Load all .yml files
-        const files = await fg('**/*.yml', { cwd: this.rootPath, absolute: true });
+        if (parsed) {
+            this.registry.addParsedDoc(parsed, this);
+        }
 
-        for (const file of files) {
-            const relativePath = path.relative(this.rootPath, file);
-            if (relativePath === 'pack.yml') continue;
+        // Load fragments from pack root
+        const ymlFiles = await fg('**/*.yml', { cwd: this.rootPath, ignore: ['pack.yml'] });
+        for (const f of ymlFiles) {
+            const fullPath = path.join(this.rootPath, f);
+            this.loadFragment(fullPath, f);
+        }
 
-            const content = readFileSync(file, 'utf8');
-            const { parsed, diagnostics } = parseYaml(content, relativePath);
-
-            this.diagnostics.push(...diagnostics);
-
-            if (parsed) {
-                this.registry.addParsedDoc(parsed, this);
+        // Load fragments from include paths
+        for (const includePath of this.includePaths) {
+            if (existsSync(includePath)) {
+                const includeFiles = await fg('**/*.yml', { cwd: includePath });
+                for (const f of includeFiles) {
+                    const fullPath = path.join(includePath, f);
+                    this.loadFragment(fullPath, f);
+                }
             }
         }
 
@@ -112,6 +119,25 @@ export class Pack {
             for (const f of structFiles) {
                 this.structureFiles.add(f.toUpperCase().replace(/\\/g, '/'));
             }
+        }
+    }
+
+    private loadFragment(fullPath: string, relativePath: string) {
+        try {
+            const content = readFileSync(fullPath, 'utf8');
+            const { parsed, diagnostics: yamlDiagnostics } = parseYaml(content, relativePath);
+            this.diagnostics.push(...yamlDiagnostics);
+
+            if (parsed) {
+                this.registry.addParsedDoc(parsed, this);
+            }
+        } catch (e: any) {
+            this.diagnostics.push({
+                code: 'FILE_READ_ERROR',
+                message: `Failed to read file: ${e.message}`,
+                severity: 'error',
+                file: relativePath
+            });
         }
     }
 

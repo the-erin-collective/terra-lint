@@ -65,13 +65,25 @@ export function resolveValue(node: Node | null | undefined, pack: Pack, parentDo
             }
         }
 
+        // Terra MetaString: ${ref} interpolation
+        if (val.includes('${')) {
+            const regex = /\${([^}]+)}/g;
+            let match;
+            let result = val;
+            while ((match = regex.exec(val)) !== null) {
+                const ref = match[1];
+                const resolved = resolveMetaRef('$' + ref, pack, parentDoc, node);
+                result = result.replace(match[0], String(resolved));
+            }
+            // If the whole thing was one interpolation and resulted in a number, return as number
+            if (/^-?\d+(\.\d+)?$/.test(result)) return Number(result);
+            return result;
+        }
+
+        // Terra MetaValue: $ref (entire scalar)
         if (val.startsWith('$')) {
             // Handle $file.yml:path.to.thing
             return resolveMetaRef(val, pack, parentDoc, node);
-        }
-        if (val.startsWith('<<')) {
-            const ref = val.substring(2).trim();
-            return resolveMetaRef('$' + ref, pack, parentDoc, node);
         }
 
         // return the cleaned string or number
@@ -84,10 +96,15 @@ export function resolveValue(node: Node | null | undefined, pack: Pack, parentDo
             const { key, value } = pair as any;
             if (isScalar(key)) {
                 const keyStr = String(key.value);
+                // Terra MetaMap: "<<" (quoted) OR Standard YAML Merge: "<<" (unquoted key)
                 if (keyStr === '<<') {
-                    // Handle meta merge
-                    const merged = resolveMetaMerge(value as Node, pack, parentDoc);
-                    Object.assign(result, merged);
+                    if (isSeq(value)) {
+                        for (const item of value.items) {
+                            Object.assign(result, resolveMetaMerge(item as Node, pack, parentDoc));
+                        }
+                    } else {
+                        Object.assign(result, resolveMetaMerge(value as Node, pack, parentDoc));
+                    }
                 } else {
                     result[keyStr] = resolveValue(value as Node, pack, parentDoc);
                 }
@@ -99,6 +116,18 @@ export function resolveValue(node: Node | null | undefined, pack: Pack, parentDo
     if (isSeq(node)) {
         const result: any[] = [];
         for (const item of node.items) {
+            // Terra MetaList: - << ref
+            if (isScalar(item) && String((item as Scalar).value).startsWith('<< ')) {
+                const ref = String((item as Scalar).value).substring(3).trim();
+                const resolved = resolveMetaRef('$' + ref, pack, parentDoc, item);
+                if (Array.isArray(resolved)) {
+                    result.push(...resolved);
+                } else {
+                    result.push(resolved);
+                }
+                continue;
+            }
+
             const resolved = resolveValue(item as Node, pack, parentDoc);
             if (Array.isArray(resolved)) {
                 result.push(...resolved);
@@ -113,39 +142,40 @@ export function resolveValue(node: Node | null | undefined, pack: Pack, parentDo
 }
 
 function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, node?: any): any {
-    // Handle $file.yml:path.to.thing or $file.yml:top-level-key
-    let pathStr = ref.substring(1);
+    // ref could be "$file.yml:path" or "file.yml:path" (if called from MetaString)
+    let pathStr = ref.startsWith('$') ? ref.substring(1) : ref;
+
     if (pathStr.startsWith('{') && pathStr.endsWith('}')) {
         pathStr = pathStr.substring(1, pathStr.length - 1);
-    } else if (pathStr.includes('{')) {
-        // Handle cases like ${file:path} or ${file:path} - 1
-        const match = pathStr.match(/{([^}]+)}/);
-        if (match) {
-            pathStr = match[1];
-        }
     }
 
+    // Split into file and path. Terra uses : but occasionally . if it's a direct handle
     const parts = pathStr.split(':');
-    if (parts.length < 2) return ref;
+    let filePath: string;
+    let pathInFile: string[];
 
-    const filePath = parts[0];
-    // Path can be separated by : or . in some Terra versions, or just one segment
-    const pathInFile = parts.slice(1).join(':').split('.');
-
-    if (!pack || !pack.registry) {
-        return ref;
+    if (parts.length < 2) {
+        // Just a filename? $options.yml (resolves whole file)
+        filePath = pathStr;
+        pathInFile = [];
+    } else {
+        filePath = parts[0];
+        pathInFile = parts.slice(1).join(':').split('.');
     }
 
+    if (!pack || !pack.registry) return ref;
+
+    const normalizedSearch = filePath.replace(/\\/g, '/');
     const allDocs = pack.registry.getAllDocs();
-    const exactMatches = allDocs.filter(d => d.filePath === filePath);
+    const exactMatches = allDocs.filter(d => d.filePath.replace(/\\/g, '/') === normalizedSearch);
 
     const suffixMatches = exactMatches.length
         ? exactMatches
-        : allDocs.filter(d =>
-            d.filePath.endsWith(filePath) ||
-            d.filePath.endsWith('/' + filePath) ||
-            d.filePath.endsWith('\\' + filePath)
-        );
+        : allDocs.filter(d => {
+            const dfp = d.filePath.replace(/\\/g, '/');
+            return dfp.endsWith(normalizedSearch) ||
+                dfp.endsWith('/' + normalizedSearch);
+        });
 
     if (suffixMatches.length === 0) {
         pack.diagnostics.push({
@@ -179,12 +209,15 @@ function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, node?: a
 
     let current: Node | null | undefined = doc.doc.contents as any;
     for (const part of pathInFile) {
+        let next: Node | null | undefined;
         if (isMap(current)) {
-            current = current.get(part, true) as any;
+            next = (current as any).get(part, true) as any;
         } else if (isSeq(current) && /^\d+$/.test(part)) {
             const index = parseInt(part, 10);
-            current = (current as any).items[index];
-        } else {
+            next = (current as any).items[index];
+        }
+
+        if (next === undefined || next === null) {
             pack.diagnostics.push({
                 code: 'META_REF_PATH_MISSING',
                 message: `Path "${pathInFile.join('.')}" not found in meta file "${filePath}". Missing: "${part}"`,
@@ -197,6 +230,7 @@ function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, node?: a
             });
             return ref;
         }
+        current = next;
     }
 
     return resolveValue(current, pack, doc);
