@@ -125,7 +125,7 @@ export function resolveValue(
         if (val.startsWith('$') && (val.includes('.yml') || val.includes('.yaml') || val.includes(':'))) {
             const resolved = resolveMetaRef(val, pack, parentDoc, node);
             
-            // Create metaSite information
+            // Create metaSite information - MetaValue is always from a scalar
             const metaSite = {
                 file: parentDoc.filePath,
                 range: node.range ? { start: node.range[0], end: node.range[1] } : undefined,
@@ -482,15 +482,19 @@ export function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, n
     }
 
     const resolved = resolveValue(current, pack, doc);
-    return markAsMetaDerived(resolved, parentDoc.filePath, range, String(node?.value || ref));
+    // Determine the metaSite kind from the reference node
+    const metaSiteKind = node ? 
+        (isScalar(node) ? 'scalar' : isMap(node) ? 'map' : isSeq(node) ? 'seq' : 'scalar') : 
+        'scalar';
+    return markAsMetaDerived(resolved, parentDoc.filePath, range, String(node?.value || ref), metaSiteKind);
 }
 
 // Helper function to mark PValue as meta-derived
-function markAsMetaDerived(pvalue: PValue, metaSiteFile: string, metaSiteRange?: { start: number; end: number }, metaSiteRaw?: string): PValue {
+function markAsMetaDerived(pvalue: PValue, metaSiteFile: string, metaSiteRange?: { start: number; end: number }, metaSiteRaw?: string, metaSiteKind?: "scalar" | "map" | "seq"): PValue {
     const metaSite = {
         file: metaSiteFile,
         range: metaSiteRange,
-        kind: pvalue.origin.authoring?.kind || 'scalar',
+        kind: metaSiteKind || 'scalar', // Default to scalar since most meta refs are from scalars
         raw: metaSiteRaw
     };
 

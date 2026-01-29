@@ -183,7 +183,9 @@ export function validatePValueSchema(pvalue: PValue, schema: Record<string, Sche
             
             let message = `Field "${fieldPath}" should be a ${field.type}, but got ${validationKind}.`;
             if (isMeta && val.origin.metaSite) {
-                message += ` (referenced from ${val.origin.metaSite.file}:${val.origin.metaSite.range?.start || '?'})`;
+                const metaSitePos = val.origin.metaSite.range?.start ? 
+                    `:${val.origin.metaSite.range.start}` : '';
+                message += ` (referenced from ${val.origin.metaSite.file}${metaSitePos})`;
             }
 
             pack.diagnostics.push({
@@ -238,7 +240,9 @@ function validatePValueSchemaField(pvalue: PValue, field: SchemaField, pack: Pac
         
         let message = `Entry "${path}" should be a ${field.type}, but got ${validationKind}.`;
         if (isMeta && pvalue.origin.metaSite) {
-            message += ` (referenced from ${pvalue.origin.metaSite.file}:${pvalue.origin.metaSite.range?.start || '?'})`;
+            const metaSitePos = pvalue.origin.metaSite.range?.start ? 
+                `:${pvalue.origin.metaSite.range.start}` : '';
+            message += ` (referenced from ${pvalue.origin.metaSite.file}${metaSitePos})`;
         }
 
         pack.diagnostics.push({
