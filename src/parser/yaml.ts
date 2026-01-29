@@ -1,14 +1,38 @@
 import { parseDocument, isScalar, isAlias, isMap, isSeq, LineCounter, Document, Node } from 'yaml';
 import { Diagnostic, Location, Range } from '../types/diagnostic.js';
 
+export interface ProvenanceEntry {
+    file: string;
+    range: Range;
+    sourceKind?: 'root' | 'include';
+}
+
+export type ProvenanceMap = Map<string, ProvenanceEntry>; // Key is JSON pointer (e.g., "/stages/0")
+
 export interface ParsedYaml {
     doc: Document;
     text: string;
     lineCounter: LineCounter;
     filePath: string;
+    /** Indicates whether this document came from the main pack root or an include path */
+    sourceKind?: 'root' | 'include';
 }
 
-export function parseYaml(text: string, filePath: string): { parsed?: ParsedYaml, diagnostics: Diagnostic[] } {
+export function setProvenance(map: ProvenanceMap, path: string | string[], entry: ProvenanceEntry) {
+    const pointer = Array.isArray(path)
+        ? '/' + path.map(p => p.replace(/~/g, '~0').replace(/\//g, '~1')).join('/')
+        : path;
+    map.set(pointer, entry);
+}
+
+export function getProvenance(map: ProvenanceMap, path: string | string[]): ProvenanceEntry | undefined {
+    const pointer = Array.isArray(path)
+        ? '/' + path.map(p => p.replace(/~/g, '~0').replace(/\//g, '~1')).join('/')
+        : path;
+    return map.get(pointer);
+}
+
+export function parseYaml(text: string, filePath: string, sourceKind?: 'root' | 'include'): { parsed?: ParsedYaml, diagnostics: Diagnostic[] } {
     const lineCounter = new LineCounter();
     const diagnostics: Diagnostic[] = [];
 
@@ -43,10 +67,12 @@ export function parseYaml(text: string, filePath: string): { parsed?: ParsedYaml
                 doc,
                 text,
                 lineCounter,
-                filePath
+                filePath,
+                sourceKind
             },
             diagnostics
         };
+
     } catch (e: any) {
         diagnostics.push({
             code: 'YAML_PARSE_EXCEPTION',

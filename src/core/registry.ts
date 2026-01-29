@@ -95,6 +95,10 @@ export class Registry {
 
         try {
             let base: any = {};
+            // Maintain a merged provenance map
+            const baseProvenance: Map<string, any> = new Map();
+            Object.defineProperty(base, '__terra_provenance', { value: baseProvenance, enumerable: false });
+
             if (obj.extends) {
                 const extNode = obj.node.get('extends', true);
                 const parentIds = Array.isArray(obj.extends) ? obj.extends : [obj.extends];
@@ -106,6 +110,13 @@ export class Registry {
                     if (parentEffective) {
                         // Merge parents: earlier (actually later in reverse loop) overwrite
                         Object.assign(base, parentEffective);
+
+                        // Merge parent provenance
+                        if (parentEffective.__terra_provenance instanceof Map) {
+                            for (const [k, v] of parentEffective.__terra_provenance.entries()) {
+                                baseProvenance.set(k, v);
+                            }
+                        }
                     } else {
                         // Attempt to find range of the specific parentId in YAML
                         let range = undefined;
@@ -137,6 +148,19 @@ export class Registry {
 
             // Priority Shadowing: child values overwrite parents entirely (shallow merge)
             const result = Object.assign(base, currentResolved.value);
+
+            // Merge child provenance (overwrites parent provenance for same keys)
+            // currentResolved.value might not be an object if simple type, checking just in case
+            if (currentResolved.value && typeof currentResolved.value === 'object') {
+                // Use the provenance map returned by resolveValue if available, or the one attached to value
+                const childProv = currentResolved.provenance || (currentResolved.value as any).__terra_provenance;
+                if (childProv instanceof Map) {
+                    for (const [k, v] of childProv.entries()) {
+                        baseProvenance.set(k, v);
+                    }
+                }
+            }
+
             return result;
         } finally {
             seen.delete(key);

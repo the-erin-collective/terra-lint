@@ -1,13 +1,16 @@
 import { isMap, isScalar, isSeq, Node, Scalar } from 'yaml';
 import path from 'path';
 import { Pack } from '../core/pack.js';
-import { ParsedYaml } from '../parser/yaml.js';
+import { ParsedYaml, ProvenanceMap, ProvenanceEntry, setProvenance } from '../parser/yaml.js';
+import { validateBlockState, validateExpression } from './validation-utils.js';
 
 export interface ResolvedResult {
     value: any;
+    // origin field is kept for backward compatibility but provenance map is primary
     origin: ParsedYaml;
     range?: any;
     interpolated?: boolean;
+    provenance?: ProvenanceMap;
 }
 
 export function resolveValue(
@@ -19,16 +22,30 @@ export function resolveValue(
     if (!node) return { value: undefined, origin: parentDoc };
 
     const pathStr = fieldPath.join('.');
-    const isExpressionField = (
-        pathStr.endsWith('.palette') ||
-        pathStr.includes('.slant') ||
-        pathStr.includes('.features.') ||
-        ['BEDROCK', 'threshold', 'multiplier', 'base_y'].includes(fieldPath[fieldPath.length - 1])
-    );
+    const lastField = fieldPath[fieldPath.length - 1];
+
+    // Initialize sidecar provenance map
+    const provenance: ProvenanceMap = new Map();
+
+    // Field-aware gating: only validate expressions in known expression contexts
+    const isExpressionField = pack.isExpressionField(pathStr, lastField);
+
+    // Field-aware gating: only validate block states in known block contexts
+    const isBlockField = pack.isBlockField(pathStr, lastField);
 
     if (isScalar(node)) {
         let val = String(node.value);
         let interpolated = false;
+
+        // Current node's provenance
+        const selfProvenance: ProvenanceEntry = {
+            file: parentDoc.filePath,
+            range: node.range ? {
+                start: { ...parentDoc.lineCounter.linePos(node.range[0]), offset: node.range[0] },
+                end: { ...parentDoc.lineCounter.linePos(node.range[1]), offset: node.range[1] }
+            } : undefined as any,
+            sourceKind: parentDoc.sourceKind
+        };
 
         // Terra MetaString: ${ref} interpolation
         if (val.includes('${')) {
@@ -44,7 +61,13 @@ export function resolveValue(
             val = result.replace(/\r?\n/g, ' ').trim(); // Handle multi-line expressions
 
             if (/^-?\d+(\.\d+)?$/.test(val)) {
-                return { value: Number(val), origin: parentDoc, range: node.range, interpolated: true };
+                return {
+                    value: Number(val),
+                    origin: parentDoc,
+                    range: node.range,
+                    interpolated: true,
+                    provenance // Scalars don't usually need a map unless we track sub-parts, but we return it for consistency
+                };
             }
         }
 
@@ -53,20 +76,23 @@ export function resolveValue(
             return resolveMetaRef(val, pack, parentDoc, node);
         }
 
-        // Handle numeric underscores (e.g., 1_000_000)
-        if (/^\d[0-9_]*$/.test(val) && val.includes('_')) {
-            val = val.replace(/_/g, '');
-            if (!isNaN(Number(val))) return { value: Number(val), origin: parentDoc, range: node.range, interpolated };
+        // Handle numeric underscores (e.g., 1_000_000, 1_000.5, 1e1_0)
+        // Supports integers, floats, and scientific notation with underscores
+        if (/^[\d_]+(\.[\d_]+)?([eE][+-]?[\d_]+)?$/.test(val) && val.includes('_')) {
+            const normalized = val.replace(/_/g, '');
+            if (!isNaN(Number(normalized))) return { value: Number(normalized), origin: parentDoc, range: node.range, interpolated };
         }
 
         // Field-Aware Validation
         if (isExpressionField || interpolated) {
-            const pipeCount = (val.match(/\|/g) || []).length;
-            if (pipeCount > 0 && pipeCount % 2 !== 0) {
+            const exprRes = validateExpression(val);
+            if (!exprRes.isValid) {
+                // Downgrade to warning unless in a strict expression context (palette, slant)
+                const isStrictExprContext = pathStr.includes('.palette') || pathStr.includes('.slant');
                 pack.diagnostics.push({
                     code: 'MALFORMED_EXPRESSION',
-                    message: `Unbalanced absolute value pipes in expression: "${val}"`,
-                    severity: 'error',
+                    message: exprRes.message || `Malformed expression: "${val}"`,
+                    severity: isStrictExprContext ? 'error' : 'warning',
                     file: parentDoc.filePath,
                     range: node.range ? {
                         start: { ...parentDoc.lineCounter.linePos(node.range[0]), offset: node.range[0] },
@@ -74,52 +100,64 @@ export function resolveValue(
                     } : undefined
                 });
             }
+        }
 
-            const firstBracket = val.indexOf('[');
-            const firstBrace = val.indexOf('{');
-            if (firstBracket !== -1 && (firstBrace === -1 || firstBracket < firstBrace)) {
-                const closeIndex = val.lastIndexOf(']');
-                let isValid = true;
-                if (closeIndex === -1 || closeIndex < firstBracket || val.split('[').length !== 2 || val.split(']').length !== 2) {
-                    isValid = false;
-                } else {
-                    const statesPart = val.substring(firstBracket + 1, closeIndex);
-                    if (statesPart.trim()) {
-                        const pairs = statesPart.split(',');
-                        for (const pair of pairs) {
-                            const eqIndex = pair.indexOf('=');
-                            if (eqIndex === -1 || eqIndex === 0 || eqIndex === pair.length - 1) {
-                                isValid = false;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if (!isValid) {
-                    pack.diagnostics.push({
-                        code: 'INVALID_BLOCK_STATE',
-                        message: `Invalid block state syntax: "${val}". Expected "id[key=value, ...]"`,
-                        severity: 'error',
-                        file: parentDoc.filePath,
-                        range: node.range ? {
-                            start: { ...parentDoc.lineCounter.linePos(node.range[0]), offset: node.range[0] },
-                            end: { ...parentDoc.lineCounter.linePos(node.range[1]), offset: node.range[1] }
-                        } : undefined
-                    });
-                }
+        // Block state validation: only in known block contexts, or if it looks like a block ID
+        const looksLikeBlockId = /^[a-z_]+:[a-z_]+/.test(val) || val.toUpperCase().startsWith('BLOCK:');
+        if ((isBlockField || looksLikeBlockId) && val.includes('[')) {
+            const blockRes = validateBlockState(val);
+            if (!blockRes.isValid) {
+                // Error in palette layers (likely real), warning elsewhere
+                const isInPalette = pathStr.includes('.palette');
+                pack.diagnostics.push({
+                    code: 'INVALID_BLOCK_STATE',
+                    message: blockRes.message || `Invalid block state: "${val}"`,
+                    severity: isInPalette ? 'error' : 'warning',
+                    file: parentDoc.filePath,
+                    range: node.range ? {
+                        start: { ...parentDoc.lineCounter.linePos(node.range[0]), offset: node.range[0] },
+                        end: { ...parentDoc.lineCounter.linePos(node.range[1]), offset: node.range[1] }
+                    } : undefined
+                });
             }
         }
 
         const finalValue = val === String(node.value) ? node.value : val;
-        return { value: finalValue, origin: parentDoc, range: node.range, interpolated };
+        // Include self provenance for scalar
+        provenance.set('', selfProvenance);
+
+        return {
+            value: finalValue,
+            origin: parentDoc,
+            range: node.range,
+            interpolated,
+            provenance
+        };
     }
 
     if (isMap(node)) {
         const result: any = {};
-        const metadata = new Map<string, { origin: ParsedYaml, range: any }>();
-        Object.defineProperty(result, '__terra_origin', { value: parentDoc, enumerable: false });
-        Object.defineProperty(result, '__terra_range', { value: node.range, enumerable: false });
-        Object.defineProperty(result, '__terra_metadata', { value: metadata, enumerable: false });
+
+        // Populate self provenance for the map itself
+        setProvenance(provenance, '', {
+            file: parentDoc.filePath,
+            range: node.range ? {
+                start: { ...parentDoc.lineCounter.linePos(node.range[0]), offset: node.range[0] },
+                end: { ...parentDoc.lineCounter.linePos(node.range[1]), offset: node.range[1] }
+            } : undefined as any,
+            sourceKind: parentDoc.sourceKind
+        });
+
+        // Attach hidden provenance map to the result object for easy access later (e.g. in extends)
+        Object.defineProperty(result, '__terra_provenance', { value: provenance, enumerable: false });
+
+        // Helper to merge provenance maps
+        const mergeProvenance = (prefix: string, source: ProvenanceMap) => {
+            for (const [key, entry] of source.entries()) {
+                const newKey = key === '' ? prefix : `${prefix}${key}`;
+                provenance.set(newKey, entry);
+            }
+        };
 
         for (const pair of node.items) {
             const { key, value } = pair as any;
@@ -131,37 +169,138 @@ export function resolveValue(
                         : [resolveMetaMerge(value as Node, pack, parentDoc)];
 
                     for (const m of merged) {
-                        if (m && typeof m === 'object') {
-                            Object.assign(result, m);
-                            const mMeta = (m as any).__terra_metadata;
-                            if (mMeta instanceof Map) {
-                                for (const [mk, mv] of mMeta.entries()) metadata.set(mk, mv);
-                            }
+                        // Phase 1 fix: Only merge plain objects, not arrays or primitives
+                        if (m === null || m === undefined) continue;
+                        if (Array.isArray(m)) {
+                            pack.diagnostics.push({
+                                code: 'META_MERGE_NOT_A_MAP',
+                                message: 'Cannot merge an array into a map. The merge target resolved to a list, not an object.',
+                                severity: 'error',
+                                file: parentDoc.filePath,
+                                range: value.range ? {
+                                    start: { ...parentDoc.lineCounter.linePos(value.range[0]), offset: value.range[0] },
+                                    end: { ...parentDoc.lineCounter.linePos(value.range[1]), offset: value.range[1] }
+                                } : undefined
+                            });
+                            continue;
+                        }
+                        if (typeof m !== 'object') {
+                            pack.diagnostics.push({
+                                code: 'META_MERGE_NOT_A_MAP',
+                                message: `Cannot merge a scalar (${typeof m}) into a map. The merge target must be an object.`,
+                                severity: 'error',
+                                file: parentDoc.filePath,
+                                range: value.range ? {
+                                    start: { ...parentDoc.lineCounter.linePos(value.range[0]), offset: value.range[0] },
+                                    end: { ...parentDoc.lineCounter.linePos(value.range[1]), offset: value.range[1] }
+                                } : undefined
+                            });
+                            continue;
+                        }
+
+                        // Safe to merge: m is a plain object
+                        Object.assign(result, m);
+
+                        // Merge provenance from the merged object
+                        if ((m as any).__terra_provenance) {
+                            // When merging a full object, its keys are at root of result
+                            mergeProvenance('', (m as any).__terra_provenance);
                         }
                     }
                 } else {
                     const resolved = resolveValue(value as Node, pack, parentDoc, [...fieldPath, keyStr]);
                     result[keyStr] = resolved.value;
-                    metadata.set(keyStr, { origin: resolved.origin, range: resolved.range });
+
+                    // Add provenance for this key's value
+                    if (resolved.provenance) {
+                        mergeProvenance(`/${keyStr}`, resolved.provenance);
+                    } else if (resolved.value !== undefined) {
+                        // Fallback for primitive values resolved without provenance map
+                        setProvenance(provenance, `/${keyStr}`, {
+                            file: resolved.origin.filePath,
+                            range: resolved.range ? {
+                                start: { ...resolved.origin.lineCounter.linePos(resolved.range[0]), offset: resolved.range[0] },
+                                end: { ...resolved.origin.lineCounter.linePos(resolved.range[1]), offset: resolved.range[1] }
+                            } : undefined as any,
+                            sourceKind: resolved.origin.sourceKind
+                        });
+                    }
                 }
             }
         }
-        return { value: result, origin: parentDoc, range: node.range };
+        return { value: result, origin: parentDoc, range: node.range, provenance };
     }
 
     if (isSeq(node)) {
         const result: any[] = [];
-        Object.defineProperty(result, '__terra_origin', { value: parentDoc, enumerable: false });
-        Object.defineProperty(result, '__terra_range', { value: node.range, enumerable: false });
-        // Sequences don't typically have field-level metadata in the same way, but we track origin for the list items
-        for (const item of node.items) {
-            // List-Merge Compatibility
+
+        // Populate self provenance for the list itself
+        setProvenance(provenance, '', {
+            file: parentDoc.filePath,
+            range: node.range ? {
+                start: { ...parentDoc.lineCounter.linePos(node.range[0]), offset: node.range[0] },
+                end: { ...parentDoc.lineCounter.linePos(node.range[1]), offset: node.range[1] }
+            } : undefined as any,
+            sourceKind: parentDoc.sourceKind
+        });
+
+        // Attach hidden provenance map
+        Object.defineProperty(result, '__terra_provenance', { value: provenance, enumerable: false });
+
+        // Helper to merge provenance maps
+        const mergeProvenance = (prefix: string, source: ProvenanceMap) => {
+            for (const [key, entry] of source.entries()) {
+                const newKey = key === '' ? prefix : `${prefix}${key}`;
+                provenance.set(newKey, entry);
+            }
+        };
+
+        for (let i = 0; i < node.items.length; i++) {
+            const item = node.items[i];
+            const currentIndex = result.length;
+
+            // List-Merge Compatibility: - <<: ref
             if (isMap(item) && (pathStr.includes('palette') || pathStr.includes('features'))) {
                 const mapItems = (item as any).items;
-                if (mapItems.length === 1 && isScalar(mapItems[0].key) && (mapItems[0].key.value === '<<' || mapItems[0].key.value === '<<:')) {
+                if (mapItems.length === 1 && isScalar(mapItems[0].key) && mapItems[0].key.value === '<<') {
                     const merged = resolveMetaMerge(mapItems[0].value as Node, pack, parentDoc);
-                    if (Array.isArray(merged)) result.push(...merged);
-                    else if (typeof merged === 'object') result.push(merged);
+                    if (Array.isArray(merged)) {
+                        // Splicing a list
+                        merged.forEach((mItem, j) => {
+                            result.push(mItem);
+                            // If the merged list has provenance, try to map it
+                            if ((merged as any).__terra_provenance) {
+                                // This is tricky: we'd need to shift indices. 
+                                // For now we might lose granular provenance of spliced items unless we iterate carefully.
+                                // Ideal: look up provenance of index 'j' in merged list
+                                const sourceMap = (merged as any).__terra_provenance as ProvenanceMap;
+                                // We can't easily iterate the source map by index without parsing keys.
+                                // Simplified approach: If the item itself is an object/array, it has its own provenance.
+                            }
+                        });
+                        // Add provenance for the spliced items (best effort)
+                        if ((merged as any).__terra_provenance) {
+                            const sourceMap = (merged as any).__terra_provenance as ProvenanceMap;
+                            // Map keys like "/0/..." to "/{currentIndex}/..."
+                            for (const [key, entry] of sourceMap.entries()) {
+                                if (key.startsWith('/')) {
+                                    // key is like /0/foo or /0
+                                    const firstSlash = key.indexOf('/', 1);
+                                    const indexStr = firstSlash === -1 ? key.substring(1) : key.substring(1, firstSlash);
+                                    const index = parseInt(indexStr);
+                                    if (!isNaN(index)) {
+                                        const suffix = firstSlash === -1 ? '' : key.substring(firstSlash);
+                                        setProvenance(provenance, `/${currentIndex + index}${suffix}`, entry);
+                                    }
+                                }
+                            }
+                        }
+                    } else if (typeof merged === 'object' && merged !== null) {
+                        result.push(merged);
+                        if ((merged as any).__terra_provenance) {
+                            mergeProvenance(`/${currentIndex}`, (merged as any).__terra_provenance);
+                        }
+                    }
                     continue;
                 }
             }
@@ -170,15 +309,61 @@ export function resolveValue(
             if (isScalar(item) && String((item as Scalar).value).startsWith('<< ')) {
                 const refPart = String((item as Scalar).value).substring(3).trim();
                 const resolved = resolveMetaRef('$' + refPart, pack, parentDoc, item);
-                if (Array.isArray(resolved.value)) result.push(...resolved.value);
-                else result.push(resolved.value);
+                if (Array.isArray(resolved.value)) {
+                    const mergedList = resolved.value;
+                    mergedList.forEach((mItem, j) => {
+                        result.push(mItem);
+                    });
+                    // Propagate provenance from the referenced list
+                    if (resolved.provenance) {
+                        const sourceMap = resolved.provenance;
+                        for (const [key, entry] of sourceMap.entries()) {
+                            if (key.startsWith('/')) {
+                                const firstSlash = key.indexOf('/', 1);
+                                const indexStr = firstSlash === -1 ? key.substring(1) : key.substring(1, firstSlash);
+                                const index = parseInt(indexStr);
+                                if (!isNaN(index)) {
+                                    const suffix = firstSlash === -1 ? '' : key.substring(firstSlash);
+                                    setProvenance(provenance, `/${currentIndex + index}${suffix}`, entry);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    result.push(resolved.value);
+                    if (resolved.provenance) {
+                        mergeProvenance(`/${currentIndex}`, resolved.provenance);
+                    } else {
+                        setProvenance(provenance, `/${currentIndex}`, {
+                            file: resolved.origin.filePath,
+                            range: resolved.range ? {
+                                start: { ...resolved.origin.lineCounter.linePos(resolved.range[0]), offset: resolved.range[0] },
+                                end: { ...resolved.origin.lineCounter.linePos(resolved.range[1]), offset: resolved.range[1] }
+                            } : undefined as any,
+                            sourceKind: resolved.origin.sourceKind
+                        });
+                    }
+                }
                 continue;
             }
 
             const resolved = resolveValue(item as Node, pack, parentDoc, [...fieldPath, '[]']);
             result.push(resolved.value);
+
+            if (resolved.provenance) {
+                mergeProvenance(`/${currentIndex}`, resolved.provenance);
+            } else {
+                setProvenance(provenance, `/${currentIndex}`, {
+                    file: resolved.origin.filePath,
+                    range: resolved.range ? {
+                        start: { ...resolved.origin.lineCounter.linePos(resolved.range[0]), offset: resolved.range[0] },
+                        end: { ...resolved.origin.lineCounter.linePos(resolved.range[1]), offset: resolved.range[1] }
+                    } : undefined as any,
+                    sourceKind: resolved.origin.sourceKind
+                });
+            }
         }
-        return { value: result, origin: parentDoc, range: node.range };
+        return { value: result, origin: parentDoc, range: node.range, provenance };
     }
 
     return { value: undefined, origin: parentDoc };
@@ -296,16 +481,30 @@ export function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, n
 
     return resolveValue(current, pack, doc);
 }
-
+/**
+ * Resolves a merge target node. Returns the resolved value directly.
+ * The caller is responsible for validating the type and emitting diagnostics.
+ */
 function resolveMetaMerge(node: Node, pack: Pack, parentDoc: ParsedYaml): any {
     if (isScalar(node)) {
         const res = resolveValue(node, pack, parentDoc);
-        return (res.value && typeof res.value === 'object') ? res.value : {};
+        // Return the actual resolved value - caller will validate type
+        return res.value;
     }
     if (isSeq(node)) {
-        let result = {};
-        for (const item of node.items) Object.assign(result, resolveMetaMerge(item as Node, pack, parentDoc));
+        // A sequence of merge targets - resolve each and merge plain objects
+        let result: any = {};
+        for (const item of node.items) {
+            const merged = resolveMetaMerge(item as Node, pack, parentDoc);
+            if (merged !== null && merged !== undefined && typeof merged === 'object' && !Array.isArray(merged)) {
+                Object.assign(result, merged);
+            }
+            // Arrays/scalars from nested merge are silently ignored here
+            // The outer caller will catch type mismatches at the top level
+        }
         return result;
     }
-    return resolveValue(node, pack, parentDoc).value;
+    // Map node - resolve it
+    const res = resolveValue(node, pack, parentDoc);
+    return res.value;
 }
