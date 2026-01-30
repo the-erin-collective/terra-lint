@@ -8,7 +8,7 @@ export interface Origin {
         start: { line: number; col: number; offset: number };
         end: { line: number; col: number; offset: number };
     };
-    via?: "direct" | "meta" | "extends";
+    via?: "direct" | "meta" | "extends" | "meta-skipped";
     authoring?: {
         kind: AuthoringKind;
         scalarType?: "string" | "number" | "boolean" | "null" | "unknown";

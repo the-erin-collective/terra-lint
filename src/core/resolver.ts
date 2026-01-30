@@ -13,11 +13,14 @@ function isFileLikeMetaRef(raw: string): boolean {
 
     if (s.includes(".yml") || s.includes(".yaml") || s.includes("/") || s.includes("\\")) return true;
 
-    // If it has a colon, only accept if the LHS looks path-ish
+    // If it has a colon, accept if the LHS looks like a filename (has any extension)
     const i = s.indexOf(":");
     if (i !== -1) {
         const lhs = s.slice(0, i);
-        return lhs.includes("/") || lhs.includes("\\") || lhs.includes(".yml") || lhs.includes(".yaml");
+        return lhs.includes("/") || lhs.includes("\\") || 
+               lhs.includes(".yml") || lhs.includes(".yaml") ||
+               // Accept any filename with an extension (not just yml/yaml)
+               /^[^/\\]+\.[^/\\]+$/.test(lhs);
     }
     return false;
 }
@@ -25,6 +28,12 @@ function isFileLikeMetaRef(raw: string): boolean {
 // Helper function to detect file-like paths
 function isFileLikePath(s: string): boolean {
     return s.includes(".yml") || s.includes(".yaml") || s.includes("/") || s.includes("\\");
+}
+
+// Helper function to detect and block directory traversal
+function hasDirectoryTraversal(s: string): boolean {
+    // Block obvious traversal attempts
+    return s.includes('../') || s.includes('..\\') || s.startsWith('../') || s.startsWith('..\\');
 }
 
 export function resolveValue(
@@ -468,6 +477,9 @@ export function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, n
     // Note: This logic duplicates path finding. Ideally extract 'findDoc(path)' logic.
     // For now, I'll basically inline the logic but return PValue.
 
+    let pathStr = ref.startsWith('$') ? ref.substring(1) : ref;
+    if (pathStr.startsWith('{') && pathStr.endsWith('}')) pathStr = pathStr.substring(1, pathStr.length - 1);
+
     // Hard guard: don't treat non-file-like refs as meta refs at all
     if (!isFileLikeMetaRef(ref)) {
         const range = node?.range ? { start: node.range[0], end: node.range[1] } : undefined;
@@ -475,6 +487,35 @@ export function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, n
             start: { ...parentDoc.lineCounter.linePos(range.start), offset: range.start },
             end: { ...parentDoc.lineCounter.linePos(range.end), offset: range.end }
         } : undefined;
+        const origin: Origin = {
+            via: 'meta-skipped',
+            file: parentDoc.filePath,
+            authoring: {
+                kind: 'scalar',
+                scalarType: 'string',
+                raw: ref
+            },
+            fullRange
+        };
+        return createPScalar(ref, origin);
+    }
+
+    // Security: block directory traversal attempts
+    if (hasDirectoryTraversal(pathStr)) {
+        const range = node?.range ? { start: node.range[0], end: node.range[1] } : undefined;
+        const fullRange = range ? {
+            start: { ...parentDoc.lineCounter.linePos(range.start), offset: range.start },
+            end: { ...parentDoc.lineCounter.linePos(range.end), offset: range.end }
+        } : undefined;
+        
+        pack.diagnostics.push({
+            code: 'META_REF_TRAVERSAL',
+            message: `Meta-reference contains directory traversal which is not allowed: "${pathStr}"`,
+            severity: 'error',
+            file: parentDoc.filePath,
+            range: fullRange
+        });
+        
         const origin: Origin = {
             via: 'direct',
             file: parentDoc.filePath,
@@ -487,9 +528,6 @@ export function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, n
         };
         return createPScalar(ref, origin);
     }
-
-    let pathStr = ref.startsWith('$') ? ref.substring(1) : ref;
-    if (pathStr.startsWith('{') && pathStr.endsWith('}')) pathStr = pathStr.substring(1, pathStr.length - 1);
 
     // Handle Windows absolute paths like C:\... - don't split on colon there
     let filePath: string;
@@ -705,11 +743,15 @@ function tryFilesystemFallback(filePath: string, pack: Pack, parentDoc: ParsedYa
         return { 
             kind: "ambiguous", 
             candidates: foundFiles.map(f => {
-                // Try to make path relative to the most appropriate root
-                const relativeToPack = path.relative(pack.rootPath, f.path);
-                const relativeToInclude = f.root !== pack.rootPath ? 
-                    ` (from include: ${path.relative(f.root, f.path)})` : '';
-                return relativeToPack + relativeToInclude;
+                if (f.root === pack.rootPath) {
+                    // File is in pack root - show relative to pack root
+                    return path.relative(pack.rootPath, f.path);
+                } else {
+                    // File is in include path - show include-relative path with label
+                    const includeName = path.basename(f.root);
+                    const relativeToInclude = path.relative(f.root, f.path);
+                    return `include(${includeName})/${relativeToInclude}`;
+                }
             })
         };
     }
