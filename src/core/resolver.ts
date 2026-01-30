@@ -1,6 +1,6 @@
 import { isMap, isScalar, isSeq, Node, isAlias } from 'yaml';
-import path from 'path';
-import { existsSync, readFileSync } from 'fs';
+import * as path from 'path';
+import * as fs from 'fs';
 import type { Pack } from '../core/pack.js';
 import { ParsedYaml, parseYaml } from '../parser/yaml.js';
 import { validateBlockState, validateExpression } from './validation-utils.js';
@@ -19,17 +19,21 @@ function getMetaRefConfidence(s: string): MetaRefConfidence {
             ref = ref.substring(1, ref.length - 1);
         }
         
-        // Contains extension or path separator -> definitely file-like
-        if (isFileLikePath(ref)) {
+        // Contains YAML extension -> definitely file-like
+        if (hasYamlExtension(ref)) {
             return "definitely_ref";
         }
         
-        // Contains colon - only treat as probably if left side looks file-like
+        // Contains colon - check if left side looks file-like
         if (ref.includes(':')) {
             const lhs = ref.split(':', 1)[0];
             const lhsLower = lhs.toLowerCase();
-            // Explicitly support meta.yml/meta.yaml shorthand
-            if (lhsLower === 'meta.yml' || lhsLower === 'meta.yaml' || isFileLikePath(lhs)) {
+            // YAML extension on left side = definitely file-like (common Terra pattern)
+            if (hasYamlExtension(lhs) || lhsLower === 'meta.yml' || lhsLower === 'meta.yaml') {
+                return "definitely_ref";
+            }
+            // If left side has path separators, it's likely a file path
+            if (lhs.includes('/') || lhs.includes('\\')) {
                 return "probably_ref";
             }
             return "unlikely_ref"; // namespaced ids like minecraft:stone
@@ -40,13 +44,21 @@ function getMetaRefConfidence(s: string): MetaRefConfidence {
             return "probably_ref";
         }
         
-        // Contains dot but no yml/yaml extension - be more conservative
-        if (ref.includes('.') && !ref.includes('.yml') && !ref.includes('.yaml')) {
-            // Only treat as probably if it looks like a filename (has path chars or common patterns)
-            if (ref.includes('/') || ref.includes('\\') || /^[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+$/.test(ref)) {
+        // Be more conservative with slashes - only treat as definitely if also has yml/yaml extension
+        if (ref.includes('/') || ref.includes('\\')) {
+            if (ref.endsWith('.yml') || ref.endsWith('.yaml')) {
+                return "definitely_ref";
+            }
+            return "probably_ref"; // Has path separators but no extension - probably a file
+        }
+        
+        // Only treat as probably if it has clear file indicators
+        if (ref.includes('.')) {
+            // Only treat as probably if it has path separators or ends with yml/yaml
+            if (ref.includes('/') || ref.includes('\\') || hasYamlExtension(ref)) {
                 return "probably_ref";
             }
-            return "unlikely_ref"; // Likely version numbers, domain-like IDs, etc.
+            return "unlikely_ref"; // Likely version numbers, domain-like IDs, dotted identifiers
         }
         
         // Single word with no path characteristics - unlikely to be a file
@@ -77,46 +89,85 @@ function attemptRegistryResolution(filePart: string, pack: Pack, currentFilePath
     return { docs: [], ambiguous: false };
 }
 
-// Helper function to detect file-like paths
-function isFileLikePath(s: string): boolean {
-    return s.includes(".yml") || s.includes(".yaml") || s.includes("/") || s.includes("\\");
+// Helper function to detect YAML file extensions (strict matching)
+function hasYamlExtension(s: string): boolean {
+    const t = s.toLowerCase();
+    return t.endsWith('.yml') || t.endsWith('.yaml');
 }
 
-// Helper function to detect and block directory traversal
+// Helper function to normalize file paths for consistent matching
+function normalizeFilePath(filePath: string): string {
+    // Convert to forward slashes for consistency
+    let normalized = filePath.replace(/\\/g, '/');
+    
+    // Collapse multiple slashes to single slash
+    normalized = normalized.replace(/\/+/g, '/');
+    
+    // Remove ./ segments (but keep ../ for security checks)
+    normalized = normalized.replace(/\/\.\//g, '/');
+    
+    // Remove leading ./ if present
+    if (normalized.startsWith('./')) {
+        normalized = normalized.substring(2);
+    }
+    
+    return normalized;
+}
+
+// Helper function to detect and block dangerous directory traversal
 function hasDirectoryTraversal(p: string): boolean {
-    // Normalize path separators and check for .. segments
+    // Normalize path separators and check for dangerous segments
     const norm = p.replace(/\\/g, '/');
-    return norm.split('/').some(seg => seg === '..');
+    const segs = norm.split('/');
+    return segs.some(seg => 
+        seg === '..' ||           // Directory traversal (dangerous)
+        seg.includes('\0')        // Null bytes (defensive)
+    );
+    // Note: We allow '.' and empty segments ('') as they're common in legit paths
+    // and are handled safely by our containment checks
 }
 
-// Helper function for secure path resolution with traversal protection
-function securePathResolve(root: string, filePath: string): string | null {
+// Helper function to get a safe candidate path (may not exist)
+// Returns a path that is guaranteed to be under the root, but caller must check existence
+function getSafeCandidatePath(root: string, filePath: string): string | null {
     try {
         const rootAbs = path.resolve(root);
-        const resolved = path.resolve(rootAbs, filePath);
-        const rel = path.relative(rootAbs, resolved);
-        
-        // Normalize to POSIX for consistent traversal checking
-        const relNorm = rel.replace(/\\/g, '/');
-        
-        // Block actual traversal: ".." as whole segment or starting with "../"
-        if (relNorm === '..' || relNorm.startsWith('../')) {
-            return null; // Directory traversal attempt
-        }
-        
-        return resolved;
+        const candidate = path.resolve(rootAbs, filePath);
+
+        // Block path traversal by lexical containment first
+        if (!isUnder(candidate, rootAbs)) return null;
+
+        // If it doesn't exist yet, we can still safely return candidate
+        if (!fs.existsSync(candidate)) return candidate;
+
+        // If it exists, harden against symlink escapes
+        const rootReal = fs.realpathSync(rootAbs);
+        const candReal = fs.realpathSync(candidate);
+        if (!isUnder(candReal, rootReal)) return null;
+
+        return candidate;
     } catch {
         return null;
     }
 }
 
-// Helper function to check if a path is under another path
+// Helper function to check if a path is under another path (cross-platform safe)
 function isUnder(childPath: string, parentPath: string): boolean {
     const childAbs = path.resolve(childPath);
     const parentAbs = path.resolve(parentPath);
-    const childNorm = childAbs.replace(/\\/g, '/').toLowerCase();
-    const parentNorm = parentAbs.replace(/\\/g, '/').toLowerCase();
-    return childNorm === parentNorm || childNorm.startsWith(parentNorm + '/');
+    
+    // Use path.relative for cross-platform safe containment check
+    const rel = path.relative(parentAbs, childAbs);
+    
+    // It's under if:
+    // - Is empty (same path) OR
+    // - Doesn't start with '..' or '..' + separator
+    // - Is not '..' (parent directory)
+    // - Is not absolute (path.relative would return absolute for completely different drives)
+    return rel === '' || 
+           (!rel.startsWith('..' + path.sep) && 
+            rel !== '..' && 
+            !path.isAbsolute(rel));
 }
 
 // Helper function to find in registry with directory traversal for meta.yml
@@ -136,19 +187,20 @@ function findInRegistry(filePart: string, pack: Pack, currentFilePath?: string):
         if (ownerRoot) {
             let currentDir = path.dirname(currentFileAbs);
             const ownerRootAbs = path.resolve(ownerRoot);
-            const ownerRootNorm = ownerRootAbs.replace(/\\/g, '/').toLowerCase();
             
             // Use canonical filename for joining
             const canonicalFileName = fpLower === 'meta.yml' ? 'meta.yml' : 'meta.yaml';
             
-            // Walk up until we reach the owning root
-            while (currentDir.replace(/\\/g, '/').toLowerCase().startsWith(ownerRootNorm)) {
+            // Walk up until we reach the owning root using safe containment checks
+            while (isUnder(currentDir, ownerRootAbs)) {
                 const localMetaPath = path.join(currentDir, canonicalFileName);
-                const localDoc = allDocs.find(d => 
-                    path.resolve(d.filePath) === path.resolve(localMetaPath)
-                );
-                if (localDoc) {
-                    return { docs: [localDoc], ambiguous: false };
+                const localMetaPathAbs = path.resolve(localMetaPath);
+                
+                // Check if this document is the meta.yml we're looking for
+                const matchingDocs = allDocs.filter(d => path.resolve(d.filePath).toLowerCase() === localMetaPathAbs.toLowerCase());
+                
+                if (matchingDocs.length > 0) {
+                    return { docs: matchingDocs, ambiguous: matchingDocs.length > 1 };
                 }
                 
                 // Move up to parent directory
@@ -172,14 +224,12 @@ function findInRegistry(filePart: string, pack: Pack, currentFilePath?: string):
         
         for (const root of tier.roots) {
             const rootAbs = path.resolve(root);
-            const rootAbsNorm = rootAbs.replace(/\\/g, '/').toLowerCase();
 
             const matches = allDocs.filter(d => {
                 const dfp = path.resolve(d.filePath);
-                const dfpNorm = dfp.replace(/\\/g, '/').toLowerCase();
                 
-                // Skip docs that aren't under this root (case-insensitive check)
-                if (dfpNorm !== rootAbsNorm && !dfpNorm.startsWith(rootAbsNorm + '/')) return false;
+                // Skip docs that aren't under this root
+                if (!isUnder(dfp, rootAbs)) return false;
                 
                 // Use path.relative for robust cross-platform path computation
                 const relative = path.relative(rootAbs, dfp);
@@ -188,7 +238,8 @@ function findInRegistry(filePart: string, pack: Pack, currentFilePath?: string):
                 if (tier.type === 'exact') {
                     return normalizedRelative === normalizedSearch;
                 } else {
-                    return normalizedRelative.endsWith(normalizedSearch) || normalizedRelative.endsWith('/' + normalizedSearch);
+                    return normalizedRelative === normalizedSearch
+                        || normalizedRelative.endsWith('/' + normalizedSearch);
                 }
             });
             
@@ -209,7 +260,7 @@ function findInRegistry(filePart: string, pack: Pack, currentFilePath?: string):
 }
 
 // Helper function to parse meta-ref candidate
-function parseMetaRefCandidate(raw: string): { filePart: string; pathInFile: string[]; hasColon: boolean; looksWindowsAbs: boolean } | null {
+function parseMetaRefCandidate(raw: string): { filePart: string; pathInFile: string[]; hasColon: boolean; looksWindowsAbs: boolean; hasMultipleColons: boolean } | null {
     if (!raw.startsWith('$')) return null;
     
     let pathStr = raw.substring(1);
@@ -221,9 +272,14 @@ function parseMetaRefCandidate(raw: string): { filePart: string; pathInFile: str
             filePart: pathStr,
             pathInFile: [],
             hasColon: false,
-            looksWindowsAbs: true
+            looksWindowsAbs: true,
+            hasMultipleColons: false
         };
     }
+
+    // Check for multiple colons (unusual in Terra)
+    const colonCount = (pathStr.match(/:/g) || []).length;
+    const hasMultipleColons = colonCount > 1;
 
     // Split on first colon only for meta refs
     const colonIndex = pathStr.indexOf(':');
@@ -241,10 +297,11 @@ function parseMetaRefCandidate(raw: string): { filePart: string; pathInFile: str
     }
 
     return {
-        filePart: filePath,
+        filePart: filePath, // Keep original for security checks, normalize later
         pathInFile,
         hasColon,
-        looksWindowsAbs: false
+        looksWindowsAbs: false,
+        hasMultipleColons
     };
 }
 
@@ -252,11 +309,39 @@ export function resolveValue(
     node: Node | null | undefined,
     pack: Pack,
     parentDoc: ParsedYaml,
-    fieldPath: string[] = []
+    fieldPath: string[] = [],
+    aliasDepth: number = 0
 ): PValue {
+    // Prevent infinite recursion from alias cycles
+    if (aliasDepth > 50) {
+        const origin: Origin = {
+            via: 'direct',
+            file: parentDoc.filePath,
+            authoring: {
+                kind: 'scalar',
+                scalarType: 'string',
+                raw: '[ALIAS_CYCLE]'
+            },
+            fullRange: node?.range ? {
+                start: { ...parentDoc.lineCounter.linePos(node.range[0]), offset: node.range[0] },
+                end: { ...parentDoc.lineCounter.linePos(node.range[1]), offset: node.range[1] }
+            } : undefined
+        };
+        
+        pack.diagnostics.push({
+            code: 'ALIAS_CYCLE',
+            message: 'Alias cycle detected: maximum alias resolution depth exceeded',
+            severity: 'error',
+            file: parentDoc.filePath,
+            range: origin.fullRange
+        });
+        
+        return createPScalar('[ALIAS_CYCLE]', origin);
+    }
+
     // Handle YAML aliases by resolving them first
     if (node && isAlias(node)) {
-        return resolveValue(node.resolve(parentDoc.doc), pack, parentDoc, fieldPath);
+        return resolveValue(node.resolve(parentDoc.doc), pack, parentDoc, fieldPath, aliasDepth + 1);
     }
     
     // Default origin for missing nodes is just the file (or parent node's location?)
@@ -304,7 +389,6 @@ export function resolveValue(
 
     if (isScalar(node)) {
         let val = String(node.value);
-        let interpolated = false;
 
         // Terra MetaString: ${ref}
         if (val.includes('${')) {
@@ -316,7 +400,7 @@ export function resolveValue(
             
             while ((match = regex.exec(val)) !== null) {
                 const ref = match[1].trim();
-                const rawRef = '$' + ref;
+                const rawRef = ref.startsWith('$') ? ref : '$' + ref;
                 const metaSiteRaw = '${' + ref + '}';
                 
                 // Guard: only resolve references with sufficient confidence
@@ -340,7 +424,12 @@ export function resolveValue(
                     continue;
                 }
 
-                const resolved = resolveMetaRef(rawRef, pack, parentDoc, node, metaSiteRaw);
+                // Create interpolation range object for accurate diagnostics
+                const interpSite: RangeLike = node.range
+                    ? { range: [node.range[0] + match.index, node.range[0] + match.index + match[0].length] }
+                    : { range: null };
+
+                const resolved = resolveMetaRef(rawRef, pack, parentDoc, interpSite, metaSiteRaw);
                 
                 // Don't rewrite "skipped" into "meta" - only wrap if actually resolved
                 if (resolved.origin?.via === 'meta-skipped') {
@@ -379,6 +468,35 @@ export function resolveValue(
             if (didResolveAny) {
                 const interpolatedVal = out.replace(/\r?\n/g, ' ').trim();
 
+                // Validate expressions in interpolated strings
+                if (isExpressionField) {
+                    const exprRes = validateExpression(interpolatedVal);
+                    if (!exprRes.isValid) {
+                        const isStrictExprContext = pathStr.includes('.palette') || pathStr.includes('.slant');
+                        if (exprRes.errors && exprRes.errors.length > 0) {
+                            for (const err of exprRes.errors) {
+                                // For interpolated strings, use full range instead of trying to map sub-ranges
+                                // because interpolation changes character positions
+                                pack.diagnostics.push({
+                                    code: 'EXPR_SYNTAX_ERROR',
+                                    message: `Syntax Error: ${err.message} (at expression offset ${err.range.start}-${err.range.end})`,
+                                    severity: isStrictExprContext ? 'error' : 'warning',
+                                    file: parentDoc.filePath,
+                                    range: origin.fullRange
+                                });
+                            }
+                        } else {
+                            pack.diagnostics.push({
+                                code: 'MALFORMED_EXPRESSION',
+                                message: exprRes.message || `Malformed expression: "${interpolatedVal}"`,
+                                severity: isStrictExprContext ? 'error' : 'warning',
+                                file: parentDoc.filePath,
+                                range: origin.fullRange
+                            });
+                        }
+                    }
+                }
+
                 // Create metaSite for MetaString interpolation
                 const metaSite = {
                     file: parentDoc.filePath,
@@ -402,21 +520,25 @@ export function resolveValue(
                     }
                 };
 
-                if (/^-?\d+(\.\d+)?$/.test(interpolatedVal)) {
-                    const numericVal = Number(interpolatedVal);
-                    const numericOrigin: Origin = {
-                        ...metaStringOrigin,
-                        authoring: {
-                            ...metaStringOrigin.authoring!,
-                            scalarType: 'number',
-                            raw: interpolatedVal
-                        }
-                    };
-                    return createPScalar(numericVal, numericOrigin);
+                // Enhanced numeric parsing to match scalar handling (supports underscores and exponents)
+                if (/^[\d_]+(\.[\d_]+)?([eE][+-]?[\d_]+)?$/.test(interpolatedVal)) {
+                    const normalized = interpolatedVal.replace(/_/g, '');
+                    if (!isNaN(Number(normalized))) {
+                        const numericVal = Number(normalized);
+                        const numericOrigin: Origin = {
+                            ...metaStringOrigin,
+                            authoring: {
+                                ...metaStringOrigin.authoring!,
+                                scalarType: 'number',
+                                raw: interpolatedVal
+                            }
+                        };
+                        return createPScalar(numericVal, numericOrigin);
+                    }
                 }
                 return createPScalar(interpolatedVal, metaStringOrigin);
             } else {
-                // Nothing resolved, return original scalar unchanged
+                // Nothing resolved, return original scalar unchanged (preserve original type)
                 return createPScalar(node.value, origin);
             }
         }
@@ -424,7 +546,7 @@ export function resolveValue(
         // Terra MetaValue: $ref (entire scalar)
         if (val.startsWith('$')) {
             // Use the original resolveMetaRef - it will handle security checks
-            const resolved = resolveMetaRef(val, pack, parentDoc, node);
+            const resolved = resolveMetaRef(val, pack, parentDoc, toRangeLike(node));
             
             // Don't rewrite "skipped" into "meta" - only wrap if actually resolved
             if (resolved.origin?.via === 'meta-skipped') {
@@ -458,14 +580,14 @@ export function resolveValue(
         }
 
         // Field-Aware Validation
-        if (isExpressionField || interpolated) {
+        if (isExpressionField) {
             const exprRes = validateExpression(val);
             if (!exprRes.isValid) {
                 const isStrictExprContext = pathStr.includes('.palette') || pathStr.includes('.slant');
                 if (exprRes.errors && exprRes.errors.length > 0) {
                     for (const err of exprRes.errors) {
                         let absRange = undefined;
-                        if (!interpolated && node.range) {
+                        if (node.range) {
                             const startOffset = node.range[0] + err.range.start;
                             const endOffset = node.range[0] + err.range.end;
                             absRange = {
@@ -473,9 +595,7 @@ export function resolveValue(
                                 end: { ...parentDoc.lineCounter.linePos(endOffset), offset: endOffset }
                             };
                         }
-                        const message = interpolated 
-                            ? `Syntax Error: ${err.message} (at expression offset ${err.range.start}-${err.range.end})`
-                            : `Syntax Error: ${err.message}`;
+                        const message = `Syntax Error: ${err.message}`;
                         pack.diagnostics.push({
                             code: 'EXPR_SYNTAX_ERROR',
                             message,
@@ -545,7 +665,7 @@ export function resolveValue(
                                 
                                 const confidence = getMetaRefConfidence(refCandidate);
                                 if (confidence !== 'unlikely_ref') {
-                                    mergeSources.push({source: resolveMetaRef(refCandidate, pack, parentDoc, item), node: item as Node});
+                                    mergeSources.push({source: resolveMetaRef(refCandidate, pack, parentDoc, toRangeLike(item, 'scalar')), node: item as Node});
                                 } else {
                                     // Not file-like -> merge is invalid
                                     const mergeRange = item.range ? {
@@ -562,7 +682,7 @@ export function resolveValue(
                                     });
                                 }
                             } else {
-                                mergeSources.push({source: resolveValue(item as Node, pack, parentDoc), node: item as Node});
+                                mergeSources.push({source: resolveValue(item as Node, pack, parentDoc, fieldPath, aliasDepth), node: item as Node});
                             }
                         }
                     } else {
@@ -574,7 +694,7 @@ export function resolveValue(
                             
                             const confidence = getMetaRefConfidence(refCandidate);
                             if (confidence !== 'unlikely_ref') {
-                                mergeSources.push({source: resolveMetaRef(refCandidate, pack, parentDoc, mergeValue), node: mergeValue});
+                                mergeSources.push({source: resolveMetaRef(refCandidate, pack, parentDoc, toRangeLike(mergeValue, 'scalar')), node: mergeValue});
                             } else {
                                 // Plain scalar - this is an error for map merge
                                 const mergeRange = mergeValue.range ? {
@@ -591,7 +711,7 @@ export function resolveValue(
                                 });
                             }
                         } else {
-                            mergeSources.push({source: resolveValue(mergeValue as Node, pack, parentDoc), node: mergeValue});
+                            mergeSources.push({source: resolveValue(mergeValue as Node, pack, parentDoc, fieldPath, aliasDepth), node: mergeValue});
                         }
                     }
                 } else {
@@ -629,7 +749,7 @@ export function resolveValue(
 
         // Third pass: apply local keys (overwrite defaults)
         for (const { keyStr, value } of localPairs) {
-            const resolved = resolveValue(value as Node, pack, parentDoc, [...fieldPath, keyStr]);
+            const resolved = resolveValue(value as Node, pack, parentDoc, [...fieldPath, keyStr], aliasDepth);
             entries.set(keyStr, resolved);
         }
 
@@ -646,7 +766,7 @@ export function resolveValue(
             if (isScalar(item) && String(item.value).startsWith('<< ')) {
                 const refPart = String(item.value).substring(3).trim();
                 const raw = refPart.startsWith('$') ? refPart : ('$' + refPart);
-                const resolved = resolveMetaRef(raw, pack, parentDoc, item);
+                const resolved = resolveMetaRef(raw, pack, parentDoc, toRangeLike(item, 'seq'));
 
                 if (resolved.kind === 'seq') {
                     // Splice items
@@ -680,9 +800,9 @@ export function resolveValue(
                     if (isScalar(valNode)) {
                         const v = String(valNode.value);
                         const ref = v.startsWith('$') ? v : '$' + v;
-                        resolved = resolveMetaRef(ref, pack, parentDoc, valNode);
+                        resolved = resolveMetaRef(ref, pack, parentDoc, toRangeLike(valNode, 'map'));
                     } else {
-                        resolved = resolveValue(valNode as Node, pack, parentDoc);
+                        resolved = resolveValue(valNode as Node, pack, parentDoc, fieldPath, aliasDepth);
                     }
 
                     if (resolved.kind === 'seq') {
@@ -707,7 +827,7 @@ export function resolveValue(
                 }
             }
 
-            items.push(resolveValue(item as Node, pack, parentDoc, [...fieldPath, '[]']));
+            items.push(resolveValue(item as Node, pack, parentDoc, [...fieldPath, '[]'], aliasDepth));
         }
         return createPSeq(items, origin);
     }
@@ -715,45 +835,22 @@ export function resolveValue(
     return createPScalar(undefined, defaultOrigin);
 }
 
-export function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, node?: any, metaSiteRaw?: string): PValue {
-    // Create cycle detection key
-    const cycleKey = path.resolve(parentDoc.filePath) + ':' + ref;
-    
-    // Check for cycles
-    if (pack.metaRefStack.has(cycleKey)) {
-        const range = node?.range ? { start: node.range[0], end: node.range[1] } : undefined;
-        const fullRange = range ? {
-            start: { ...parentDoc.lineCounter.linePos(range.start), offset: range.start },
-            end: { ...parentDoc.lineCounter.linePos(range.end), offset: range.end }
-        } : undefined;
-        
-        pack.diagnostics.push({
-            code: 'META_REF_CYCLE',
-            message: `Meta-reference cycle detected: "${ref}" creates a circular reference`,
-            severity: 'error',
-            file: parentDoc.filePath,
-            range: fullRange
-        });
-        
-        const baseOrigin: Origin = {
-            via: 'meta-skipped',
-            file: parentDoc.filePath,
-            authoring: {
-                kind: 'scalar',
-                scalarType: 'string',
-                raw: ref
-            },
-            fullRange
-        };
-        
-        return createPScalar(ref, baseOrigin);
-    }
-    
-    // Add to stack for cycle detection
-    pack.metaRefStack.add(cycleKey);
-    
-    try {
-        // Base origin for all meta refs (defaults to meta-skipped)
+// Helper type for range-only objects (not full YAML Nodes)
+type RangeTuple = readonly [number, number, number?];
+type RangeLike = { range?: RangeTuple | null; kind?: 'scalar' | 'seq' | 'map' };
+
+// Helper function to convert Node to RangeLike with site kind detection
+function toRangeLike(node?: Node | null, kind?: 'scalar' | 'seq' | 'map'): RangeLike {
+    return { 
+        range: node?.range ? [node.range[0], node.range[1], node.range[2]] : null,
+        kind: kind || 'scalar'
+    };
+}
+
+export function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, node?: RangeLike, metaSiteRaw?: string): PValue {
+    // Quick confidence check to avoid unnecessary cycle bookkeeping
+    const confidence = getMetaRefConfidence(ref);
+    if (confidence === 'unlikely_ref') {
         const range = node?.range ? { start: node.range[0], end: node.range[1] } : undefined;
         const baseOrigin: Origin = {
             via: 'meta-skipped',
@@ -768,24 +865,162 @@ export function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, n
                 end: { ...parentDoc.lineCounter.linePos(range.end), offset: range.end }
             } : undefined
         };
+        return createPScalar(ref, baseOrigin);
+    }
 
-        // Reuse parseMetaRefCandidate for consistent behavior
-        const parsed = parseMetaRefCandidate(ref);
-        if (!parsed) {
-            // If parsing fails, return meta-skipped literal
-            return createPScalar(ref, baseOrigin);
-        }
+    // Parse for cycle detection
+    const parsed = parseMetaRefCandidate(ref);
+    if (!parsed) {
+        const range = node?.range ? { start: node.range[0], end: node.range[1] } : undefined;
+        const baseOrigin: Origin = {
+            via: 'meta-skipped',
+            file: parentDoc.filePath,
+            authoring: {
+                kind: 'scalar',
+                scalarType: 'string',
+                raw: ref
+            },
+            fullRange: range ? {
+                start: { ...parentDoc.lineCounter.linePos(range.start), offset: range.start },
+                end: { ...parentDoc.lineCounter.linePos(range.end), offset: range.end }
+            } : undefined
+        };
+        return createPScalar(ref, baseOrigin);
+    }
 
-        // Security: reject Windows absolute paths entirely
-        if (parsed.looksWindowsAbs) {
+    // Base origin for all meta refs (defaults to meta-skipped)
+    const range = node?.range ? { start: node.range[0], end: node.range[1] } : undefined;
+    const baseOrigin: Origin = {
+        via: 'meta-skipped',
+        file: parentDoc.filePath,
+        authoring: {
+            kind: 'scalar',
+            scalarType: 'string',
+            raw: ref
+        },
+        fullRange: range ? {
+            start: { ...parentDoc.lineCounter.linePos(range.start), offset: range.start },
+            end: { ...parentDoc.lineCounter.linePos(range.end), offset: range.end }
+        } : undefined
+    };
+
+    // Security: reject all absolute paths (Windows, Unix, UNC)
+    if (parsed.looksWindowsAbs || 
+        path.isAbsolute(parsed.filePart) || 
+        parsed.filePart.startsWith('\\\\') || 
+        parsed.filePart.startsWith('//')) {
+        const fullRange = range ? {
+            start: { ...parentDoc.lineCounter.linePos(range.start), offset: range.start },
+            end: { ...parentDoc.lineCounter.linePos(range.end), offset: range.end }
+        } : undefined;
+        
+        pack.diagnostics.push({
+            code: 'META_REF_TRAVERSAL',
+            message: `Meta-reference contains absolute path which is not allowed: "${parsed.filePart}"`,
+            severity: 'error',
+            file: parentDoc.filePath,
+            range: fullRange
+        });
+        
+        return createPScalar(ref, baseOrigin);
+    }
+
+    // Warn about unusual multiple colon patterns
+    if (parsed.hasMultipleColons) {
+        const fullRange = range ? {
+            start: { ...parentDoc.lineCounter.linePos(range.start), offset: range.start },
+            end: { ...parentDoc.lineCounter.linePos(range.end), offset: range.end }
+        } : undefined;
+        
+        pack.diagnostics.push({
+            code: 'META_REF_MULTIPLE_COLONS',
+            message: `Meta-reference "${ref}" contains multiple colons, which is unusual in Terra. Only the first colon is used for file/path separation.`,
+            severity: 'warning',
+            file: parentDoc.filePath,
+            range: fullRange
+        });
+    }
+
+    // Security: block directory traversal attempts
+    if (hasDirectoryTraversal(parsed.filePart)) {
+        const fullRange = range ? {
+            start: { ...parentDoc.lineCounter.linePos(range.start), offset: range.start },
+            end: { ...parentDoc.lineCounter.linePos(range.end), offset: range.end }
+        } : undefined;
+        
+        pack.diagnostics.push({
+            code: 'META_REF_TRAVERSAL',
+            message: `Meta-reference contains directory traversal which is not allowed: "${parsed.filePart}"`,
+            severity: 'error',
+            file: parentDoc.filePath,
+            range: fullRange
+        });
+        
+        return createPScalar(ref, baseOrigin);
+    }
+
+    // Normalize file path for consistent matching (after security checks)
+    const normalizedFilePart = normalizeFilePath(parsed.filePart);
+
+    if (!pack || !pack.registry) return createPScalar(ref, baseOrigin);
+    
+    // Always attempt registry resolution first
+    const registryResult = attemptRegistryResolution(normalizedFilePart, pack, parentDoc.filePath);
+    
+    if (registryResult.ambiguous) {
+        // Build candidate list for registry ambiguity
+        const candidates = registryResult.docs.slice(0, 5).map(doc => {
+            const docPath = doc.filePath;
+            // Show relative to pack root or include path using safe containment checks
+            if (isUnder(docPath, pack.rootPath)) {
+                return path.relative(pack.rootPath, docPath);
+            } else {
+                // Find deepest matching include root for deterministic behavior
+                let bestIncludeRoot = null;
+                let bestIncludeRootLength = -1;
+                
+                for (const root of pack.includePaths) {
+                    if (isUnder(docPath, root) && root.length > bestIncludeRootLength) {
+                        bestIncludeRoot = root;
+                        bestIncludeRootLength = root.length;
+                    }
+                }
+                
+                if (bestIncludeRoot) {
+                    const includeName = path.basename(bestIncludeRoot);
+                    return `include(${includeName})/${path.relative(bestIncludeRoot, docPath)}`;
+                }
+                return docPath;
+            }
+        });
+        
+        pack.diagnostics.push({
+            code: 'META_REF_AMBIGUOUS',
+            message: `Meta-reference "${parsed.filePart}" is ambiguous. Multiple files match:\n` +
+                     candidates.join("\n") + (registryResult.docs.length > 5 ? "\n..." : ""),
+            severity: 'error',
+            file: parentDoc.filePath,
+            range: baseOrigin.fullRange
+        });
+        return createPScalar(ref, baseOrigin);
+    }
+
+    if (registryResult.docs.length > 0) {
+        const doc = registryResult.docs[0];
+        
+        // Create cycle key from actual resolved target
+        const cycleKey = `${path.resolve(doc.filePath)}:${parsed.pathInFile.join('.')}`;
+        
+        // Check for cycles
+        if (pack.metaRefStack.has(cycleKey)) {
             const fullRange = range ? {
                 start: { ...parentDoc.lineCounter.linePos(range.start), offset: range.start },
                 end: { ...parentDoc.lineCounter.linePos(range.end), offset: range.end }
             } : undefined;
             
             pack.diagnostics.push({
-                code: 'META_REF_TRAVERSAL',
-                message: `Meta-reference contains absolute path which is not allowed: "${parsed.filePart}"`,
+                code: 'META_REF_CYCLE',
+                message: `Meta-reference cycle detected: "${ref}" creates a circular reference`,
                 severity: 'error',
                 file: parentDoc.filePath,
                 range: fullRange
@@ -793,76 +1028,115 @@ export function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, n
             
             return createPScalar(ref, baseOrigin);
         }
+        
+        // Add to stack for cycle detection
+        pack.metaRefStack.add(cycleKey);
+        
+        try {
+            const resolution = resolveFromDoc(doc, parsed.pathInFile, pack);
+            if (!resolution.success) {
+                pack.diagnostics.push({
+                    code: 'META_REF_PATH_MISSING',
+                    message: resolution.error || 'Unknown error',
+                    severity: 'error',
+                    file: parentDoc.filePath,
+                    range: baseOrigin.fullRange
+                });
+                return createPScalar(ref, baseOrigin);
+            }
 
-        // Security: block directory traversal attempts
-        if (hasDirectoryTraversal(parsed.filePart)) {
-            const fullRange = range ? {
-                start: { ...parentDoc.lineCounter.linePos(range.start), offset: range.start },
-                end: { ...parentDoc.lineCounter.linePos(range.end), offset: range.end }
-            } : undefined;
-            
-            pack.diagnostics.push({
-                code: 'META_REF_TRAVERSAL',
-                message: `Meta-reference contains directory traversal which is not allowed: "${parsed.filePart}"`,
-                severity: 'error',
-                file: parentDoc.filePath,
-                range: fullRange
-            });
-            
-            return createPScalar(ref, baseOrigin);
+            const metaSiteKind = node?.kind || 'scalar'; // Use detected site kind or default to scalar
+            return markAsMetaDerived(resolution.result!, parentDoc.filePath, range, metaSiteRaw || ref, metaSiteKind);
+        } finally {
+            // Remove from stack when done (important for proper cycle detection)
+            pack.metaRefStack.delete(cycleKey);
         }
+    }
 
-        if (!pack || !pack.registry) return createPScalar(ref, baseOrigin);
-
-        // Get confidence level to decide resolution strategy
-        const confidence = getMetaRefConfidence(ref);
+    // If not found in registry, decide whether to attempt filesystem fallback
+    if (confidence === 'definitely_ref') {
+        const fsRes = tryFilesystemFallback(normalizedFilePart, pack, parentDoc);
         
-        // Always attempt registry resolution first
-        const registryResult = attemptRegistryResolution(parsed.filePart, pack, parentDoc.filePath);
-        
-        if (registryResult.ambiguous) {
+        if (fsRes.kind === "ambiguous") {
             pack.diagnostics.push({
                 code: 'META_REF_AMBIGUOUS',
-                message: `Meta-reference "${parsed.filePart}" is ambiguous. Multiple files match.`,
+                message: `Meta-reference "${parsed.filePart}" is ambiguous. Multiple files match:\n` +
+                         fsRes.candidates.slice(0, 5).join("\n") + (fsRes.candidates.length > 5 ? "\n..." : ""),
                 severity: 'error',
                 file: parentDoc.filePath,
                 range: baseOrigin.fullRange
             });
             return createPScalar(ref, baseOrigin);
         }
-
-        if (registryResult.docs.length > 0) {
-            const doc = registryResult.docs[0];
-            let current: Node | null | undefined = doc.doc.contents as any;
-            for (const part of parsed.pathInFile) {
-                let next: Node | null | undefined;
-                if (isMap(current)) next = (current as any).get(part, true) as any;
-                else if (isSeq(current) && /^\d+$/.test(part)) next = (current as any).items[parseInt(part, 10)];
-
-                if (next === undefined || next === null) {
+        
+        if (fsRes.kind === "found") {
+            const fallbackDoc = fsRes.doc;
+            
+            // Create cycle key from actual resolved target
+            const cycleKey = `${path.resolve(fallbackDoc.filePath)}:${parsed.pathInFile.join('.')}`;
+            
+            // Check for cycles
+            if (pack.metaRefStack.has(cycleKey)) {
+                const fullRange = range ? {
+                    start: { ...parentDoc.lineCounter.linePos(range.start), offset: range.start },
+                    end: { ...parentDoc.lineCounter.linePos(range.end), offset: range.end }
+                } : undefined;
+                
+                pack.diagnostics.push({
+                    code: 'META_REF_CYCLE',
+                    message: `Meta-reference cycle detected: "${ref}" creates a circular reference`,
+                    severity: 'error',
+                    file: parentDoc.filePath,
+                    range: fullRange
+                });
+                
+                return createPScalar(ref, baseOrigin);
+            }
+            
+            // Add to stack for cycle detection
+            pack.metaRefStack.add(cycleKey);
+            
+            try {
+                const resolution = resolveFromDoc(fallbackDoc, parsed.pathInFile, pack);
+                if (!resolution.success) {
                     pack.diagnostics.push({
                         code: 'META_REF_PATH_MISSING',
-                        message: `Path "${parsed.pathInFile.join('.')}" not found in meta file.`,
+                        message: resolution.error || 'Unknown error',
                         severity: 'error',
                         file: parentDoc.filePath,
                         range: baseOrigin.fullRange
                     });
                     return createPScalar(ref, baseOrigin);
                 }
-                current = next;
-            }
 
-            const resolved = resolveValue(current, pack, doc);
-            const metaSiteKind = node ? 
-                (isScalar(node) ? 'scalar' : isMap(node) ? 'map' : isSeq(node) ? 'seq' : 'scalar') : 
-                'scalar';
-            return markAsMetaDerived(resolved, parentDoc.filePath, range, metaSiteRaw || String(node?.value || ref), metaSiteKind);
+                const metaSiteKind = node?.kind || 'scalar'; // Use detected site kind or default to scalar
+                return markAsMetaDerived(resolution.result!, parentDoc.filePath, range, metaSiteRaw || ref, metaSiteKind);
+            } finally {
+                // Remove from stack when done (important for proper cycle detection)
+                pack.metaRefStack.delete(cycleKey);
+            }
         }
 
-        // If not found in registry, decide whether to attempt filesystem fallback
-        if (confidence === 'definitely_ref') {
-            // Try filesystem fallback for definite refs
-            const fsRes = tryFilesystemFallback(parsed.filePart, pack, parentDoc);
+        // For definite refs that we couldn't resolve, report missing file
+        pack.diagnostics.push({
+            code: 'META_REF_FILE_MISSING',
+            message: `Meta file "${parsed.filePart}" not found.`,
+            severity: 'error',
+            file: parentDoc.filePath,
+            range: baseOrigin.fullRange
+        });
+        return createPScalar(ref, baseOrigin);
+    }
+
+    // For probably refs that failed registry resolution, attempt filesystem fallback
+    // only if it looks file-like to avoid expensive disk scanning
+    if (confidence === 'probably_ref') {
+        // Only try filesystem fallback if it has clear file-like signals
+        if (hasYamlExtension(normalizedFilePart) || 
+            normalizedFilePart === 'meta.yml' || 
+            normalizedFilePart === 'meta.yaml' ||
+            normalizedFilePart.includes('/')) {
+            const fsRes = tryFilesystemFallback(normalizedFilePart, pack, parentDoc);
             
             if (fsRes.kind === "ambiguous") {
                 pack.diagnostics.push({
@@ -878,101 +1152,66 @@ export function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, n
             
             if (fsRes.kind === "found") {
                 const fallbackDoc = fsRes.doc;
-                let current: Node | null | undefined = fallbackDoc.doc.contents as any;
-                for (const part of parsed.pathInFile) {
-                    let next: Node | null | undefined;
-                    if (isMap(current)) next = (current as any).get(part, true) as any;
-                    else if (isSeq(current) && /^\d+$/.test(part)) next = (current as any).items[parseInt(part, 10)];
-
-                    if (next === undefined || next === null) {
+                
+                // Create cycle key from actual resolved target
+                const cycleKey = `${path.resolve(fallbackDoc.filePath)}:${parsed.pathInFile.join('.')}`;
+                
+                // Check for cycles
+                if (pack.metaRefStack.has(cycleKey)) {
+                    const fullRange = range ? {
+                        start: { ...parentDoc.lineCounter.linePos(range.start), offset: range.start },
+                        end: { ...parentDoc.lineCounter.linePos(range.end), offset: range.end }
+                    } : undefined;
+                    
+                    pack.diagnostics.push({
+                        code: 'META_REF_CYCLE',
+                        message: `Meta-reference cycle detected: "${ref}" creates a circular reference`,
+                        severity: 'error',
+                        file: parentDoc.filePath,
+                        range: fullRange
+                    });
+                    
+                    return createPScalar(ref, baseOrigin);
+                }
+                
+                // Add to stack for cycle detection
+                pack.metaRefStack.add(cycleKey);
+                
+                try {
+                    const resolution = resolveFromDoc(fallbackDoc, parsed.pathInFile, pack);
+                    if (!resolution.success) {
                         pack.diagnostics.push({
                             code: 'META_REF_PATH_MISSING',
-                            message: `Path "${parsed.pathInFile.join('.')}" not found in meta file.`,
+                            message: resolution.error || 'Unknown error',
                             severity: 'error',
                             file: parentDoc.filePath,
                             range: baseOrigin.fullRange
                         });
                         return createPScalar(ref, baseOrigin);
                     }
-                    current = next;
-                }
 
-                const resolved = resolveValue(current, pack, fallbackDoc);
-                const metaSiteKind = node ? 
-                    (isScalar(node) ? 'scalar' : isMap(node) ? 'map' : isSeq(node) ? 'seq' : 'scalar') : 
-                    'scalar';
-                return markAsMetaDerived(resolved, parentDoc.filePath, range, metaSiteRaw || String(node?.value || ref), metaSiteKind);
-            }
-
-            // For definite refs that we couldn't resolve, report missing file
-            pack.diagnostics.push({
-                code: 'META_REF_FILE_MISSING',
-                message: `Meta file "${parsed.filePart}" not found.`,
-                severity: 'error',
-                file: parentDoc.filePath,
-                range: baseOrigin.fullRange
-            });
-            return createPScalar(ref, baseOrigin);
-        }
-
-        // For probably refs that failed registry resolution, attempt filesystem fallback
-        // only if it looks file-like to avoid expensive disk scanning
-        if (confidence === 'probably_ref') {
-            // Only try filesystem fallback if it looks file-like or is meta.yml/meta.yaml
-            if (isFileLikePath(parsed.filePart) || parsed.filePart === 'meta.yml' || parsed.filePart === 'meta.yaml') {
-                const fsRes = tryFilesystemFallback(parsed.filePart, pack, parentDoc);
-                
-                if (fsRes.kind === "ambiguous") {
-                    pack.diagnostics.push({
-                        code: 'META_REF_AMBIGUOUS',
-                        message: `Meta-reference "${parsed.filePart}" is ambiguous. Multiple files match:\n` +
-                                 fsRes.candidates.slice(0, 5).join("\n") + (fsRes.candidates.length > 5 ? "\n..." : ""),
-                        severity: 'error',
-                        file: parentDoc.filePath,
-                        range: baseOrigin.fullRange
-                    });
-                    return createPScalar(ref, baseOrigin);
-                }
-                
-                if (fsRes.kind === "found") {
-                    const fallbackDoc = fsRes.doc;
-                    let current: Node | null | undefined = fallbackDoc.doc.contents as any;
-                    for (const part of parsed.pathInFile) {
-                        let next: Node | null | undefined;
-                        if (isMap(current)) next = (current as any).get(part, true) as any;
-                        else if (isSeq(current) && /^\d+$/.test(part)) next = (current as any).items[parseInt(part, 10)];
-
-                        if (next === undefined || next === null) {
-                            pack.diagnostics.push({
-                                code: 'META_REF_PATH_MISSING',
-                                message: `Path "${parsed.pathInFile.join('.')}" not found in meta file.`,
-                                severity: 'error',
-                                file: parentDoc.filePath,
-                                range: baseOrigin.fullRange
-                            });
-                            return createPScalar(ref, baseOrigin);
-                        }
-                        current = next;
-                    }
-
-                    const resolved = resolveValue(current, pack, fallbackDoc);
-                    const metaSiteKind = node ? 
-                        (isScalar(node) ? 'scalar' : isMap(node) ? 'map' : isSeq(node) ? 'seq' : 'scalar') : 
-                        'scalar';
-                    return markAsMetaDerived(resolved, parentDoc.filePath, range, metaSiteRaw || String(node?.value || ref), metaSiteKind);
+                    const metaSiteKind = node?.kind || 'scalar'; // Use detected site kind or default to scalar
+                    return markAsMetaDerived(resolution.result!, parentDoc.filePath, range, metaSiteRaw || ref, metaSiteKind);
+                } finally {
+                    // Remove from stack when done (important for proper cycle detection)
+                    pack.metaRefStack.delete(cycleKey);
                 }
             }
-            
-            // For probably refs that failed all resolution attempts, treat as literal
-            return createPScalar(ref, baseOrigin);
         }
-
-        // For unlikely refs, treat as literal with meta-skipped
+        
+        // For probably refs that failed all resolution attempts, treat as literal with warning
+        pack.diagnostics.push({
+            code: 'META_REF_PROBABLY_LITERAL',
+            message: `Meta-reference "${ref}" was treated as literal. It looked like a file reference but could not be resolved.`,
+            severity: 'warning',
+            file: parentDoc.filePath,
+            range: baseOrigin.fullRange
+        });
         return createPScalar(ref, baseOrigin);
-    } finally {
-        // Remove from stack when done (important for proper cycle detection)
-        pack.metaRefStack.delete(cycleKey);
     }
+
+    // For unlikely refs, treat as literal with meta-skipped
+    return createPScalar(ref, baseOrigin);
 }
 
 // Helper function to mark PValue as meta-derived
@@ -998,6 +1237,31 @@ function markAsMetaDerived(pvalue: PValue, metaSiteFile: string, metaSiteRange?:
     return pvalue;
 }
 
+// Helper function to resolve value from a parsed document
+function resolveFromDoc(
+    doc: ParsedYaml, 
+    pathInFile: string[], 
+    pack: Pack
+): { success: boolean; result?: PValue; error?: string } {
+    let current: Node | null | undefined = doc.doc.contents as any;
+    for (const part of pathInFile) {
+        let next: Node | null | undefined;
+        if (isMap(current)) next = (current as any).get(part, true) as any;
+        else if (isSeq(current) && /^\d+$/.test(part)) next = (current as any).items[parseInt(part, 10)];
+
+        if (next === undefined || next === null) {
+            return { 
+                success: false, 
+                error: `Path "${pathInFile.join('.')}" not found in meta file.` 
+            };
+        }
+        current = next;
+    }
+
+    const resolved = resolveValue(current, pack, doc);
+    return { success: true, result: resolved };
+}
+
 // Helper function for filesystem fallback
 type FsFallbackResult =
   | { kind: "found"; doc: ParsedYaml }
@@ -1008,24 +1272,89 @@ function tryFilesystemFallback(filePath: string, pack: Pack, parentDoc: ParsedYa
     const roots = [pack.rootPath, ...pack.includePaths];
     const foundFiles: Array<{path: string, root: string}> = [];
     
+    // Special handling for meta.yml/meta.yaml: walk up directories from current file
+    // If found, return immediately to avoid ambiguity with pack root meta files
+    const fpLower = filePath.toLowerCase();
+    if (fpLower === 'meta.yml' || fpLower === 'meta.yaml') {
+        const currentFileAbs = path.resolve(parentDoc.filePath);
+        const currentDir = path.dirname(currentFileAbs);
+        const ownerRoot = roots.find(root => isUnder(currentFileAbs, root));
+        
+        if (ownerRoot) {
+            const ownerRootAbs = path.resolve(ownerRoot);
+            const canonicalFileName = fpLower; // Use lowercase for consistent filesystem lookup
+            
+            // Walk up until we reach the owning root using safe containment checks
+            let searchDir = currentDir;
+            while (isUnder(searchDir, ownerRootAbs)) {
+                const metaPath = path.join(searchDir, canonicalFileName);
+                const metaPathAbs = path.resolve(metaPath);
+                
+                if (fs.existsSync(metaPathAbs) && (metaPathAbs.toLowerCase().endsWith('.yml') || metaPathAbs.toLowerCase().endsWith('.yaml'))) {
+                    // Security: Apply symlink hardening before reading
+                    try {
+                        const rootReal = fs.realpathSync(ownerRootAbs);
+                        const candReal = fs.realpathSync(metaPathAbs);
+                        if (!isUnder(candReal, rootReal)) {
+                            // Symlink escape detected, skip this file
+                            continue;
+                        }
+                    } catch (e) {
+                        // Realpath failed, skip this file for safety
+                        continue;
+                    }
+                    
+                    // Found local meta.yml, return immediately to avoid ambiguity
+                    const { parsed } = parseYaml(fs.readFileSync(metaPathAbs, 'utf8'), metaPathAbs, 'root');
+                    if (parsed) {
+                        pack.registry.addParsedDoc(parsed, pack);
+                        return { kind: "found", doc: parsed };
+                    } else {
+                        // File exists but couldn't be parsed
+                        let filePathDisplay = path.relative(pack.rootPath, metaPathAbs);
+                        // If file came from include path, show include-relative path for clarity
+                        if (ownerRoot !== pack.rootPath) {
+                            const includeName = path.basename(ownerRoot);
+                            const relativeToInclude = path.relative(ownerRoot, metaPathAbs);
+                            filePathDisplay = `include(${includeName})/${relativeToInclude}`;
+                        }
+                        pack.diagnostics.push({
+                            code: 'META_REF_READ_FAILED',
+                            message: `Meta file "${filePathDisplay}" exists but could not be parsed (empty or invalid YAML)`,
+                            severity: 'error',
+                            file: parentDoc.filePath,
+                            range: undefined
+                        });
+                        return { kind: "missing" };
+                    }
+                }
+                
+                // Move up to parent directory
+                const parentDir = path.dirname(searchDir);
+                if (parentDir === searchDir) break; // Reached root
+                searchDir = parentDir;
+            }
+        }
+    }
+    
     // First, collect all potential matches to check for ambiguity
     for (const root of roots) {
         // Try exact match first with secure resolution
-        let fullPath = securePathResolve(root, filePath);
-        if (fullPath && existsSync(fullPath) && (fullPath.endsWith('.yml') || fullPath.endsWith('.yaml'))) {
+        let fullPath = getSafeCandidatePath(root, filePath);
+        if (fullPath && fs.existsSync(fullPath) && (fullPath.toLowerCase().endsWith('.yml') || fullPath.toLowerCase().endsWith('.yaml'))) {
             foundFiles.push({path: fullPath, root});
         }
         
         // Try with .yml extension
-        if (!filePath.endsWith('.yml') && !filePath.endsWith('.yaml')) {
-            fullPath = securePathResolve(root, filePath + '.yml');
-            if (fullPath && existsSync(fullPath)) {
+        if (!fpLower.endsWith('.yml') && !fpLower.endsWith('.yaml')) {
+            fullPath = getSafeCandidatePath(root, filePath + '.yml');
+            if (fullPath && fs.existsSync(fullPath) && fullPath.toLowerCase().endsWith('.yml')) {
                 foundFiles.push({path: fullPath, root});
             }
             
             // Try with .yaml extension
-            fullPath = securePathResolve(root, filePath + '.yaml');
-            if (fullPath && existsSync(fullPath)) {
+            fullPath = getSafeCandidatePath(root, filePath + '.yaml');
+            if (fullPath && fs.existsSync(fullPath) && fullPath.toLowerCase().endsWith('.yaml')) {
                 foundFiles.push({path: fullPath, root});
             }
         }
@@ -1059,19 +1388,50 @@ function tryFilesystemFallback(filePath: string, pack: Pack, parentDoc: ParsedYa
     // Load the single found file
     const {path: fullPath} = uniqueFiles[0];
     try {
-        const content = readFileSync(fullPath, 'utf8');
+        const content = fs.readFileSync(fullPath, 'utf8');
         const { parsed } = parseYaml(content, fullPath, 'root');
         if (parsed) {
             pack.registry.addParsedDoc(parsed, pack);
             return { kind: "found", doc: parsed };
+        } else {
+            // File exists but parsing returned no document
+            let filePathDisplay = path.relative(pack.rootPath, fullPath);
+            const owningRoot = [pack.rootPath, ...pack.includePaths].find(root => isUnder(fullPath, root));
+            if (owningRoot && owningRoot !== pack.rootPath) {
+                const includeName = path.basename(owningRoot);
+                const relativeToInclude = path.relative(owningRoot, fullPath);
+                filePathDisplay = `include(${includeName})/${relativeToInclude}`;
+            }
+            
+            pack.diagnostics.push({
+                code: 'META_REF_READ_FAILED',
+                message: `Meta file "${filePathDisplay}" exists but could not be parsed (empty or invalid YAML)`,
+                severity: 'error',
+                file: parentDoc.filePath,
+                range: undefined
+            });
         }
     } catch (e) {
-        // Continue to return missing
+        // Emit diagnostic for read/parse failure
+        let filePathDisplay = path.relative(pack.rootPath, fullPath);
+        // If file came from include path, show include-relative path for clarity
+        const owningRoot = [pack.rootPath, ...pack.includePaths].find(root => isUnder(fullPath, root));
+        if (owningRoot && owningRoot !== pack.rootPath) {
+            const includeName = path.basename(owningRoot);
+            const relativeToInclude = path.relative(owningRoot, fullPath);
+            filePathDisplay = `include(${includeName})/${relativeToInclude}`;
+        }
+        
+        pack.diagnostics.push({
+            code: 'META_REF_READ_FAILED',
+            message: `Failed to read or parse meta file "${filePathDisplay}": ${e instanceof Error ? e.message : String(e)}`,
+            severity: 'error',
+            file: parentDoc.filePath,
+            range: undefined // No specific range for filesystem errors
+        });
     }
     
     return { kind: "missing" };
 }
 
-// Deprecated or integrated helpers
-function resolveMetaMerge() { }
 
