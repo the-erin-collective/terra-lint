@@ -38,6 +38,7 @@ export class Pack {
     public includePaths: string[];
     public ignorePatterns: string[];
     public rules: ValidationRules;
+    public metaRefStack: Set<string> = new Set(); // Track meta-ref resolution to detect cycles
 
     constructor(rootPath: string, opts?: { structureExtensions?: string[], includePaths?: string[], ignore?: string[], rules?: ValidationRules }) {
         this.rootPath = path.resolve(rootPath);
