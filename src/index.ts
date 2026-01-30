@@ -6,6 +6,7 @@ import fg from 'fast-glob';
 import { Pack } from './core/pack.js';
 import { Diagnostic } from './types/diagnostic.js';
 import { parse } from 'yaml';
+import { Reporter, ReporterOptions, PackReport, SummaryStats } from './core/reporter.js';
 
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
@@ -18,6 +19,9 @@ program
     .argument('<path>', 'Path to a Terra pack root or a workspace directory')
     .option('--strict', 'Treat warnings as errors', false)
     .option('--json', 'Output report in JSON format', false)
+    .option('--color <auto|always|never>', 'Color output (auto, always, never)', 'auto')
+    .option('--format <pretty|plain|json>', 'Output format (pretty, plain, json)', 'pretty')
+    .option('--warnings-as-errors', 'Treat warnings as errors', false)
     .option('--max-warnings <number>', 'Maximum number of warnings allowed', '-1')
     .option('--structure-ext <csv>', 'Comma-separated structure extensions (no dots), e.g. "nbt,tesf", "nbt"', 'nbt')
     .option('--include <dir>', 'Add an external directory for meta-reference resolution (can be used multiple times)', (val, memo: string[]) => { memo.push(val); return memo; }, [])
@@ -26,19 +30,36 @@ program
     .option('--profile <name>', 'Use a specific profile from the config file')
     .option('--workspace', 'Enable Workspace Mode: recursively search for all pack.yml files in the given path', false)
     .action(async (targetPath: string, options: any) => {
+        // Handle backward compatibility
+        if (options.json) {
+            options.format = 'json';
+        }
+        if (options.strict) {
+            options.warningsAsErrors = true;
+        }
+
+        // Initialize reporter
+        const reporterOptions: ReporterOptions = {
+            color: options.color || 'auto',
+            format: options.format || 'pretty',
+            warningsAsErrors: options.warningsAsErrors || false
+        };
+        const reporter = new Reporter(reporterOptions);
+
         let packRoots: string[] = [];
         const isWorkspace = options.workspace;
 
         if (isWorkspace) {
-            console.log(`Scanning workspace for packs: ${targetPath}`);
+            reporter.printInfo(`Scanning workspace for packs: ${targetPath}`);
             const matches = await fg('**/pack.yml', { cwd: targetPath, absolute: true, ignore: ['**/node_modules/**'] });
             packRoots = matches.map(m => path.dirname(m));
-            console.log(`Found ${packRoots.length} packs.\n`);
+            reporter.printInfo(`Found ${packRoots.length} packs.`);
+            console.log();
         } else {
             if (existsSync(path.join(targetPath, 'pack.yml'))) {
                 packRoots = [targetPath];
             } else {
-                console.error(`Error: No pack.yml found in ${targetPath}. Use --workspace to scan subdirectories.`);
+                reporter.printError(`No pack.yml found in ${targetPath}. Use --workspace to scan subdirectories.`);
                 process.exit(1);
             }
         }
@@ -75,13 +96,24 @@ program
                         }
                     }
                 } catch (e) {
-                    console.warn(`Warning: Failed to parse config file at ${configPath}`);
+                    reporter.printWarning(`Failed to parse config file at ${configPath}`);
                 }
             }
 
             const pack = new Pack(root, packOptions);
             const packName = path.basename(root);
-            console.log(`Linting pack [${packName}] at: ${pack.rootPath}`);
+            
+            // Print banner only once
+            if (packRoots.indexOf(root) === 0) {
+                reporter.printBanner(pkg.version, packRoots.length);
+            }
+            
+            // Create pack report
+            const packReport: PackReport = {
+                name: packName,
+                path: pack.rootPath,
+                diagnostics: []
+            };
 
             await pack.load();
             await pack.validate();
@@ -97,6 +129,8 @@ program
                     d.file = `[${packName}] ${d.file}`;
                 }
             }
+            
+            packReport.diagnostics = pack.diagnostics;
             allDiagnostics.push(...pack.diagnostics);
         }
 
@@ -107,34 +141,62 @@ program
             if (lineA !== lineB) return lineA - lineB;
             const colA = a.range?.start.col ?? 0;
             const colB = b.range?.start.col ?? 0;
-            if (colA !== colB) return colA - colB;
             return a.code.localeCompare(b.code);
         });
 
-        if (options.json) {
-            console.log(JSON.stringify(allDiagnostics, null, 2));
-        } else {
-            allDiagnostics.forEach(d => {
-                const loc = d.range ? `:${d.range.start.line}:${d.range.start.col}` : '';
-                console.log(`${d.file}${loc} [${d.code}] ${d.severity}: ${d.message}`);
-            });
-
-            if (isWorkspace) {
-                console.log(`\nFinal Workspace Report: Found ${totalErrors} errors and ${totalWarnings} warnings across ${packRoots.length} packs.`);
-            } else {
-                console.log(`\nFound ${totalErrors} errors and ${totalWarnings} warnings.`);
+        // Print all pack reports
+        for (const root of packRoots) {
+            const packName = path.basename(root);
+            const packDiagnostics = allDiagnostics.filter(d => 
+                isWorkspace ? d.file.startsWith(`[${packName}]`) : d.file.includes(root)
+            );
+            
+            const packReport: PackReport = {
+                name: packName,
+                path: root,
+                diagnostics: packDiagnostics
+            };
+            
+            reporter.printPackHeader(packReport);
+            reporter.printDiagnostics(packReport);
+            
+            if (packRoots.indexOf(root) < packRoots.length - 1) {
+                console.log();
             }
+        }
+
+        // Create summary stats (basic version for now)
+        const summaryStats: SummaryStats = {
+            packs: { 
+                total: packRoots.length, 
+                passed: packRoots.length - (totalErrors > 0 ? 1 : 0), 
+                warned: 0, 
+                failed: totalErrors > 0 ? 1 : 0 
+            },
+            files: { 
+                total: allDiagnostics.length || 1, 
+                passed: (allDiagnostics.length || 1) - totalErrors - totalWarnings, 
+                warned: totalWarnings, 
+                failed: totalErrors 
+            },
+            categories: {} // Will be populated in Phase 3
+        };
+
+        reporter.printSummary(summaryStats, totalErrors, totalWarnings);
+
+        if (totalErrors === 0 && totalWarnings === 0) {
+            reporter.printSuccess();
         }
 
         if (totalErrors > 0) process.exit(1);
 
         const maxWarnings = options.maxWarnings !== undefined ? parseInt(options.maxWarnings) : -1;
-        if (options.strict && totalWarnings > 0) {
-            console.error('\nStrict mode: failing due to warnings.');
+        if (options.warningsAsErrors && totalWarnings > 0) {
+            reporter.printError('Strict mode: failing due to warnings.');
             process.exit(1);
         }
         if (maxWarnings >= 0 && totalWarnings > maxWarnings) {
-            console.error(`\nFailing due to exceeding max warnings (${totalWarnings} > ${maxWarnings}).`);
+            reporter.printError(`Failing due to exceeding max warnings (${totalWarnings} > ${maxWarnings}).`);
             process.exit(1);
         }
     });

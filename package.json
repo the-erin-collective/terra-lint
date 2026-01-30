@@ -11,6 +11,7 @@
     "dev": "tsc -w"
   },
   "dependencies": {
+    "ansis": "^4.2.0",
     "commander": "^12.0.0",
     "fast-glob": "^3.3.2",
     "yaml": "^2.4.1",
