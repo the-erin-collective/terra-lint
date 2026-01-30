@@ -1007,6 +1007,46 @@ export function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, n
 
     if (registryResult.docs.length > 0) {
         const doc = registryResult.docs[0];
+        let resolution = resolveFromDoc(doc, parsed.pathInFile, pack);
+        
+        // For meta.yml files, if path not found in registry version, try parent directories
+        if (!resolution.success && normalizedFilePart.toLowerCase() === 'meta.yml') {
+            const parentMetaDocs = findParentMetaFiles(normalizedFilePart, pack, parentDoc);
+            
+            for (const parentDoc of parentMetaDocs) {
+                resolution = resolveFromDoc(parentDoc, parsed.pathInFile, pack);
+                if (resolution.success) {
+                    // Use the parent meta file that worked
+                    const cycleKey = `${path.resolve(parentDoc.filePath)}:${parsed.pathInFile.join('.')}`;
+                    
+                    if (pack.metaRefStack.has(cycleKey)) {
+                        const fullRange = range ? {
+                            start: { ...parentDoc.lineCounter.linePos(range.start), offset: range.start },
+                            end: { ...parentDoc.lineCounter.linePos(range.end), offset: range.end }
+                        } : undefined;
+                        
+                        pack.diagnostics.push({
+                            code: 'META_REF_CYCLE',
+                            message: `Meta-reference cycle detected: "${ref}" creates a circular reference`,
+                            severity: 'error',
+                            file: parentDoc.filePath,
+                            range: fullRange
+                        });
+                        
+                        return createPScalar(ref, baseOrigin);
+                    }
+                    
+                    pack.metaRefStack.add(cycleKey);
+                    
+                    try {
+                        const metaSiteKind = node?.kind || 'scalar';
+                        return markAsMetaDerived(resolution.result!, parentDoc.filePath, range, metaSiteRaw || ref, metaSiteKind);
+                    } finally {
+                        pack.metaRefStack.delete(cycleKey);
+                    }
+                }
+            }
+        }
         
         // Create cycle key from actual resolved target
         const cycleKey = `${path.resolve(doc.filePath)}:${parsed.pathInFile.join('.')}`;
@@ -1033,7 +1073,6 @@ export function resolveMetaRef(ref: string, pack: Pack, parentDoc: ParsedYaml, n
         pack.metaRefStack.add(cycleKey);
         
         try {
-            const resolution = resolveFromDoc(doc, parsed.pathInFile, pack);
             if (!resolution.success) {
                 pack.diagnostics.push({
                     code: 'META_REF_PATH_MISSING',
@@ -1260,6 +1299,63 @@ function resolveFromDoc(
 
     const resolved = resolveValue(current, pack, doc);
     return { success: true, result: resolved };
+}
+
+// Helper function to find meta.yml files in parent directories
+function findParentMetaFiles(filePath: string, pack: Pack, parentDoc: ParsedYaml): ParsedYaml[] {
+    const results: ParsedYaml[] = [];
+    const roots = [pack.rootPath, ...pack.includePaths];
+    
+    if (filePath.toLowerCase() !== 'meta.yml' && filePath.toLowerCase() !== 'meta.yaml') {
+        return results;
+    }
+    
+    const currentFileAbs = path.resolve(parentDoc.filePath);
+    const currentDir = path.dirname(currentFileAbs);
+    const ownerRoot = roots.find(root => isUnder(currentFileAbs, root));
+    
+    if (!ownerRoot) return results;
+    
+    const ownerRootAbs = path.resolve(ownerRoot);
+    const canonicalFileName = filePath.toLowerCase();
+    
+    // Walk up from current directory towards the root, but skip the first level (already tried)
+    let searchDir = path.dirname(currentDir); // Start one level up from current dir
+    
+    while (isUnder(searchDir, ownerRootAbs)) {
+        const metaPath = path.join(searchDir, canonicalFileName);
+        const metaPathAbs = path.resolve(metaPath);
+        
+        if (fs.existsSync(metaPathAbs) && (metaPathAbs.toLowerCase().endsWith('.yml') || metaPathAbs.toLowerCase().endsWith('.yaml'))) {
+            // Security: Apply symlink hardening before reading
+            try {
+                const rootReal = fs.realpathSync(ownerRootAbs);
+                const candReal = fs.realpathSync(metaPathAbs);
+                if (!isUnder(candReal, rootReal)) {
+                    // Symlink escape detected, skip this file
+                    searchDir = path.dirname(searchDir);
+                    continue;
+                }
+            } catch (e) {
+                // Realpath failed, skip this file for safety
+                searchDir = path.dirname(searchDir);
+                continue;
+            }
+            
+            const { parsed } = parseYaml(fs.readFileSync(metaPathAbs, 'utf8'), metaPathAbs, 'root');
+            if (parsed) {
+                pack.registry.addParsedDoc(parsed, pack);
+                results.push(parsed);
+            }
+        }
+        
+        // Move up to parent directory
+        const parentDir = path.dirname(searchDir);
+        if (parentDir === searchDir) break; // Reached root
+        searchDir = parentDir;
+    }
+    
+    return results;
 }
 
 // Helper function for filesystem fallback

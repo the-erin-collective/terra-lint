@@ -32,6 +32,10 @@ export function getProvenance(map: ProvenanceMap, path: string | string[]): Prov
     return map.get(pointer);
 }
 
+export function stripBom(s: string): string {
+    return s.charCodeAt(0) === 0xFEFF ? s.slice(1) : s;
+}
+
 export function parseYaml(text: string, filePath: string, sourceKind?: 'root' | 'include'): { parsed?: ParsedYaml, diagnostics: Diagnostic[] } {
     const lineCounter = new LineCounter();
     const diagnostics: Diagnostic[] = [];

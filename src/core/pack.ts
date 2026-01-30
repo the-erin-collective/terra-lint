@@ -1,7 +1,7 @@
 import fg from 'fast-glob';
 import { readFileSync, existsSync } from 'fs';
 import path from 'path';
-import { parseYaml, ParsedYaml } from '../parser/yaml.js';
+import { parseYaml, ParsedYaml, stripBom } from '../parser/yaml.js';
 import { Registry } from './registry.js';
 import { Diagnostic } from '../types/diagnostic.js';
 import { isMap, isScalar, isSeq } from 'yaml';
@@ -16,7 +16,6 @@ export interface ValidationRules {
 
 export const DEFAULT_RULES: ValidationRules = {
     expressionFields: [
-        '.palette', // suffix/include
         '.slant',   // include
         '.features.', // include
         'BEDROCK', 'threshold', 'multiplier', 'base_y' // exact field names
@@ -94,7 +93,7 @@ export class Pack {
             return;
         }
 
-        const content = readFileSync(packYmlPath, 'utf8');
+        const content = stripBom(readFileSync(packYmlPath, 'utf8'));
         const { parsed, diagnostics: yamlDiagnostics } = parseYaml(content, packYmlPath, 'root');
         this.diagnostics.push(...yamlDiagnostics);
 
@@ -321,7 +320,7 @@ export class Pack {
 
     private loadFragment(fullPath: string, relativePath: string, sourceKind: 'root' | 'include') {
         try {
-            const content = readFileSync(fullPath, 'utf8');
+            const content = stripBom(readFileSync(fullPath, 'utf8'));
             const { parsed, diagnostics: yamlDiagnostics } = parseYaml(content, fullPath, sourceKind);
             this.diagnostics.push(...yamlDiagnostics);
 
