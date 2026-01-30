@@ -145,8 +145,11 @@ export class Registry {
 
             // Priority Shadowing: child values overwrite parents entirely (shallow merge)
             if (currentResolved.kind === 'map') {
+                const META_KEYS = new Set(['type', 'id', 'extends']);
                 for (const [k, v] of currentResolved.entries) {
-                    combinedItems.set(k, v);
+                    if (!META_KEYS.has(k)) {
+                        combinedItems.set(k, v);
+                    }
                 }
             }
 
