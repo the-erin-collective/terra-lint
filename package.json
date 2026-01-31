@@ -1,10 +1,17 @@
 {
   "name": "terra-lint",
-  "version": "1.0.0",
+  "version": "1.0.1",
+  "description": "A powerful and fast Terra config pack validator and linter built with Node.js and TypeScript.",
   "type": "module",
+  "main": "./dist/index.js",
   "bin": {
     "terra-lint": "./dist/index.js"
   },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
@@ -20,5 +27,19 @@
   "devDependencies": {
     "@types/node": "^20.11.24",
     "typescript": "^5.3.3"
-  }
+  },
+  "keywords": [
+    "terra",
+    "minecraft",
+    "linting",
+    "validation",
+    "config",
+    "cli"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/the-erin-collective/terra-lint.git"
+  },
+  "author": "alizzycraft",
+  "license": "AGPL-3.0"
 }
