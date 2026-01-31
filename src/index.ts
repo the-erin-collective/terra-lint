@@ -4,7 +4,7 @@ import { readFileSync, existsSync } from 'fs';
 import path from 'path';
 import fg from 'fast-glob';
 import { Pack } from './core/pack.js';
-import { Diagnostic } from './types/diagnostic.js';
+import { Diagnostic, FileCategory, PackStats } from './types/diagnostic.js';
 import { parse } from 'yaml';
 import { Reporter, ReporterOptions, PackReport, SummaryStats } from './core/reporter.js';
 
@@ -17,10 +17,8 @@ program
     .description('Terra config pack validator / linter')
     .version(pkg.version)
     .argument('<path>', 'Path to a Terra pack root or a workspace directory')
-    .option('--strict', 'Treat warnings as errors', false)
-    .option('--json', 'Output report in JSON format', false)
     .option('--color <auto|always|never>', 'Color output (auto, always, never)', 'auto')
-    .option('--format <pretty|plain|json>', 'Output format (pretty, plain, json)', 'pretty')
+    .option('--format <pretty|plain|json|compact>', 'Output format (pretty, plain, json, compact)', 'pretty')
     .option('--warnings-as-errors', 'Treat warnings as errors', false)
     .option('--max-warnings <number>', 'Maximum number of warnings allowed', '-1')
     .option('--structure-ext <csv>', 'Comma-separated structure extensions (no dots), e.g. "nbt,tesf", "nbt"', 'nbt')
@@ -30,14 +28,6 @@ program
     .option('--profile <name>', 'Use a specific profile from the config file')
     .option('--workspace', 'Enable Workspace Mode: recursively search for all pack.yml files in the given path', false)
     .action(async (targetPath: string, options: any) => {
-        // Handle backward compatibility
-        if (options.json) {
-            options.format = 'json';
-        }
-        if (options.strict) {
-            options.warningsAsErrors = true;
-        }
-
         // Initialize reporter
         const reporterOptions: ReporterOptions = {
             color: options.color || 'auto',
@@ -67,6 +57,16 @@ program
         let allDiagnostics: Diagnostic[] = [];
         let totalErrors = 0;
         let totalWarnings = 0;
+        let aggregatedStats: PackStats = {
+            files: {},
+            categories: {
+                [FileCategory.BIOME]: { total: 0, passed: 0, warned: 0, failed: 0 },
+                [FileCategory.FEATURE]: { total: 0, passed: 0, warned: 0, failed: 0 },
+                [FileCategory.PALETTE]: { total: 0, passed: 0, warned: 0, failed: 0 },
+                [FileCategory.FUNCTION]: { total: 0, passed: 0, warned: 0, failed: 0 },
+                [FileCategory.UNKNOWN]: { total: 0, passed: 0, warned: 0, failed: 0 }
+            }
+        };
 
         function applyConfig(source: any, target: any) {
             if (!source) return;
@@ -130,6 +130,19 @@ program
                 }
             }
             
+            // Aggregate stats across all packs
+            Object.entries(pack.stats.files).forEach(([filePath, fileStats]) => {
+                const fullFilePath = isWorkspace ? `[${packName}] ${filePath}` : filePath;
+                aggregatedStats.files[fullFilePath] = { ...fileStats };
+            });
+            
+            Object.entries(pack.stats.categories).forEach(([category, catStats]) => {
+                aggregatedStats.categories[category as FileCategory].total += catStats.total;
+                aggregatedStats.categories[category as FileCategory].passed += catStats.passed;
+                aggregatedStats.categories[category as FileCategory].warned += catStats.warned;
+                aggregatedStats.categories[category as FileCategory].failed += catStats.failed;
+            });
+            
             packReport.diagnostics = pack.diagnostics;
             allDiagnostics.push(...pack.diagnostics);
         }
@@ -165,7 +178,12 @@ program
             }
         }
 
-        // Create summary stats (basic version for now)
+        // Create summary stats using aggregated data
+        const totalFiles = Object.values(aggregatedStats.categories).reduce((sum, cat) => sum + cat.total, 0);
+        const totalPassed = Object.values(aggregatedStats.categories).reduce((sum, cat) => sum + cat.passed, 0);
+        const totalWarned = Object.values(aggregatedStats.categories).reduce((sum, cat) => sum + cat.warned, 0);
+        const totalFailed = Object.values(aggregatedStats.categories).reduce((sum, cat) => sum + cat.failed, 0);
+
         const summaryStats: SummaryStats = {
             packs: { 
                 total: packRoots.length, 
@@ -174,12 +192,12 @@ program
                 failed: totalErrors > 0 ? 1 : 0 
             },
             files: { 
-                total: allDiagnostics.length || 1, 
-                passed: (allDiagnostics.length || 1) - totalErrors - totalWarnings, 
-                warned: totalWarnings, 
-                failed: totalErrors 
+                total: totalFiles || 1, 
+                passed: totalPassed, 
+                warned: totalWarned, 
+                failed: totalFailed 
             },
-            categories: {} // Will be populated in Phase 3
+            categories: aggregatedStats.categories
         };
 
         reporter.printSummary(summaryStats, totalErrors, totalWarnings);

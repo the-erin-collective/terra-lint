@@ -3,7 +3,7 @@ import { readFileSync, existsSync } from 'fs';
 import path from 'path';
 import { parseYaml, ParsedYaml, stripBom } from '../parser/yaml.js';
 import { Registry } from './registry.js';
-import { Diagnostic } from '../types/diagnostic.js';
+import { Diagnostic, FileCategory, PackStats, FileStats, CategoryStats } from '../types/diagnostic.js';
 import { isMap, isScalar, isSeq } from 'yaml';
 import { BIOME_SCHEMA, FEATURE_SCHEMA, PACK_SCHEMA, validateSchema, validatePValueSchema } from './schema.js';
 import { PValue, toJS, isPScalar, isPSeq, isPMap } from './pvalue/types.js';
@@ -38,6 +38,16 @@ export class Pack {
     public ignorePatterns: string[];
     public rules: ValidationRules;
     public metaRefStack: Set<string> = new Set(); // Track meta-ref resolution to detect cycles
+    public stats: PackStats = {
+        files: {},
+        categories: {
+            [FileCategory.BIOME]: { total: 0, passed: 0, warned: 0, failed: 0 },
+            [FileCategory.FEATURE]: { total: 0, passed: 0, warned: 0, failed: 0 },
+            [FileCategory.PALETTE]: { total: 0, passed: 0, warned: 0, failed: 0 },
+            [FileCategory.FUNCTION]: { total: 0, passed: 0, warned: 0, failed: 0 },
+            [FileCategory.UNKNOWN]: { total: 0, passed: 0, warned: 0, failed: 0 }
+        }
+    };
 
     constructor(rootPath: string, opts?: { structureExtensions?: string[], includePaths?: string[], ignore?: string[], rules?: ValidationRules }) {
         this.rootPath = path.resolve(rootPath);
@@ -79,6 +89,68 @@ export class Pack {
             }
             return fieldName && fieldName.toLowerCase() === rule.toLowerCase();
         });
+    }
+
+    public detectFileCategory(filePath: string): FileCategory {
+        const relativePath = path.relative(this.rootPath, filePath);
+        const normalizedPath = relativePath.replace(/\\/g, '/').toLowerCase();
+        
+        // Check directory structure and file patterns
+        if (normalizedPath.includes('/biomes/') || normalizedPath.startsWith('biomes/')) {
+            return FileCategory.BIOME;
+        }
+        if (normalizedPath.includes('/features/') || normalizedPath.startsWith('features/')) {
+            return FileCategory.FEATURE;
+        }
+        if (normalizedPath.includes('/palettes/') || normalizedPath.startsWith('palettes/')) {
+            return FileCategory.PALETTE;
+        }
+        if (normalizedPath.includes('/functions/') || normalizedPath.startsWith('functions/')) {
+            return FileCategory.FUNCTION;
+        }
+        
+        // Check file names
+        const fileName = path.basename(normalizedPath);
+        if (fileName.includes('biome')) {
+            return FileCategory.BIOME;
+        }
+        if (fileName.includes('feature')) {
+            return FileCategory.FEATURE;
+        }
+        if (fileName.includes('palette')) {
+            return FileCategory.PALETTE;
+        }
+        if (fileName.includes('function') || fileName.endsWith('.mcfunction')) {
+            return FileCategory.FUNCTION;
+        }
+        
+        return FileCategory.UNKNOWN;
+    }
+
+    public updateFileStats(filePath: string, category: FileCategory): void {
+        // Initialize file stats if not exists
+        if (!this.stats.files[filePath]) {
+            this.stats.files[filePath] = { total: 1, passed: 0, warned: 0, failed: 0 };
+            this.stats.categories[category].total++;
+        }
+        
+        // Get diagnostics for this file
+        const fileDiagnostics = this.diagnostics.filter(d => d.file === filePath);
+        const errors = fileDiagnostics.filter(d => d.severity === 'error').length;
+        const warnings = fileDiagnostics.filter(d => d.severity === 'warning').length;
+        
+        // Update file stats
+        const fileStats = this.stats.files[filePath];
+        if (errors > 0) {
+            fileStats.failed = 1;
+            this.stats.categories[category].failed++;
+        } else if (warnings > 0) {
+            fileStats.warned = 1;
+            this.stats.categories[category].warned++;
+        } else {
+            fileStats.passed = 1;
+            this.stats.categories[category].passed++;
+        }
     }
 
     async load() {
@@ -169,8 +241,11 @@ export class Pack {
         const yamlFiles = await fg('**/*.yaml', { cwd: this.rootPath, ignore: allIgnorePatterns });
         const allYamlFiles = [...new Set([...ymlFiles, ...yamlFiles])].filter(f => f !== 'pack.yml');
         
+        // Track all loaded files for stats
         for (const f of allYamlFiles) {
             const fullPath = path.join(this.rootPath, f);
+            const category = this.detectFileCategory(f);
+            this.updateFileStats(f, category);
             this.loadFragment(fullPath, f, 'root');
         }
 
@@ -183,6 +258,8 @@ export class Pack {
                 
                 for (const f of allIncludeFiles) {
                     const fullPath = path.join(includePath, f);
+                    const category = this.detectFileCategory(f);
+                    this.updateFileStats(f, category);
                     this.loadFragment(fullPath, f, 'include');
                 }
             }
